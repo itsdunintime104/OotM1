@@ -1,7 +1,7 @@
 > [!IMPORTANT]
-> This project does not include any game files. You need your own copy of The Legend of Zelda: Ocarina of Time for Nintendo Switch 2, as a `.nup` file.
+> This project does not include any game files. You need your own copy of OoT for Nintendo Switch 2 (title ID `0400486024DEC000`), as a `.nup` file.
 
-<h1 align="center">Ocarina M1 Max</h1>
+<h1 align="center">OotM1</h1>
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black?logo=apple" alt="Platform: macOS on Apple Silicon">
@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT">
 </p>
 
-A set of patches and one setup script that build The Legend of Zelda: Ocarina of Time (Switch 2, title `0400486024DEC000`, update v131072) as a native Mac app, tuned for a MacBook Pro with M1 Max. It runs at the game's own resolution with a 2560 × 1440 picture at about 55 to 60 frames a second.
+A set of patches and one setup script that build OoT (Switch 2, title `0400486024DEC000`, update v131072) as a native Mac app, tuned for a MacBook Pro with M1 Max. It runs at the game's own resolution with a 2560 × 1440 picture at about 55 to 60 frames a second.
 
 The engine is [seedds/nxnative](https://github.com/seedds/nxnative). This repository pins one of its commits, adds open pull requests of that project and the M1 Max work on top, and sets the app's default settings to the ones that measured best.
 
@@ -51,11 +51,11 @@ This project is not affiliated with or endorsed by Nintendo.
    ```
 3. Get this repository and run the setup script with your `.nup` file:
    ```sh
-   git clone https://github.com/itsdunintime104/OcarinaM1Max.git
-   cd OcarinaM1Max
-   ./setup.sh ~/Games/Ocarina.nup
+   git clone https://github.com/itsdunintime104/OotM1.git
+   cd OotM1
+   ./setup.sh ~/Games/game.nup
    ```
-4. Open **Ocarina of Time** from `~/Applications`.
+4. Open **OotM1** from `~/Applications`.
 
 `setup.sh` checks your Mac, downloads the engine at the pinned commit, applies the patches, builds the app from your `.nup` file and installs it. The first build takes 1 to 2 hours, most of it shader compilation. It never changes your `.nup` file.
 
@@ -113,7 +113,7 @@ Known faults:
 ## Troubleshooting
 
 - **`setup.sh` stops at the check.** It names what is missing and how to install it.
-- **macOS will not open the app.** Sign it once: `codesign -f -s - ~/Applications/"Ocarina of Time.app"` (takes a few minutes).
+- **macOS will not open the app.** Sign it once: `codesign -f -s - ~/Applications/OotM1.app` (takes a few minutes).
 - **Low frame rate.** Connect the power adapter and set High Power mode (System Settings → Battery). Close other apps that use the GPU.
 - **The log.** `~/Library/Logs/nxnative/0400486024DEC000.log`, replaced at each start; the run before is kept as `.prev.log`.
 

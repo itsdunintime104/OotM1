@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Builds The Legend of Zelda: Ocarina of Time (Switch 2, 0400486024DEC000) as a Mac app with the patches of this repository.
+# Builds OotM1 (the Switch 2 game 0400486024DEC000, update v131072) as a Mac app with the patches of this repository.
 # Usage: ./setup.sh <file.nup> [--check] [--tree <dir>] [--work <dir>] [--no-install]
 set -e
 autoload -Uz is-at-least
@@ -7,7 +7,7 @@ autoload -Uz is-at-least
 HERE=${0:A:h}; PATCHES=$HERE/patches
 REPO_URL=https://github.com/seedds/nxnative.git
 BASE=04811a634b7f9344e882129b0973dd493369dd62
-APP_NAME="Ocarina of Time.app"
+APP_NAME="OotM1.app"
 MIN_FREE_GB=80
 ROWS_COMMENT="# Rows below from seedds/nxnative#1732 (40,154 entries regenerated on main, recorded through Kokiri Forest, the Great Deku Tree, Hyrule Field, Kakariko Village, Dodongo's Cavern, Zora's Domain, Jabu-Jabu's Belly and the Forest Temple), those not already listed above."
 

@@ -1,8 +1,8 @@
-# Ocarina of Time on an M1 Max: state of the test work
+# OotM1: state of the test work on an M1 Max
 
 Status on 2026-11-11. This page describes a private test tree, not the released app. Most of the settings named here are not in this repository's `main` yet. The table in "What the test tree holds" says which.
 
-- Game: The Legend of Zelda: Ocarina of Time, title ID `0400486024DEC000`, update v131072.
+- Game: OoT (Switch 2), title ID `0400486024DEC000`, update v131072.
 - Machine: MacBook Pro with M1 Max, 32 GB, 120 Hz variable refresh screen, macOS 26.6.
 - Test conditions from 11 Nov 02:25: power adapter connected, High Power mode, windowed, the same place in the game. Earlier runs were at least partly on battery. Their power state is not known, and that includes the 10 Nov baseline and the logged frame generation run.
 - Goal: a steady 60 frames a second, or motion that feels like it.
