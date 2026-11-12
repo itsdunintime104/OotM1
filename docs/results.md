@@ -70,7 +70,7 @@ Frame generation is in the test build and is not ready:
 
 What did not help, each measured: fewer or merged submissions, the encode thread on or off, the GPU clock held at its top frequency, GPU overlap, and the copy seam switch.
 
-The changes written in the test tree on 11 Nov are in [`experiments/ocarina-m1-max`](experiments/ocarina-m1-max/README.md) as diff files. They do not apply to this repository's engine pin.
+The changes written in the test tree are in [`patches/`](../patches/series) (21 to 23, and 90 for the default settings).
 
 ## Results of 11 Nov (build 5, the game's own resolution)
 
@@ -114,7 +114,7 @@ What the trace shows:
 What was tried:
 
 - `DM_NVN_MDX_SEAM`: the gap before the second half of the main pass stays about 1 ms with the switch on. No gain. Off.
-- `DM_NVN_ASYNC_CS` (the async compute window, `experiments/ocarina-m1-max/04-mdx-seam-and-async-compute.diff`):
+- `DM_NVN_ASYNC_CS` (the async compute window, `patches/22-mdx-seam-and-async-compute.diff`):
   - It works. With it on, the two full-screen passes after the frame's largest compute group (4 dispatches, about 1.1 ms) start at the same time as that group. With it off, they start after it.
   - The gain is small. That part of the frame takes 1.445 ms on and 1.467 ms off: the passes run beside the group but slow down from 0.29 to 1.4 ms, because the group and the passes already fill the shader cores.
   - Trace: time with two or more units busy at once rose from 39.5 to 46.0 ms a second.
