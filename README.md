@@ -6,7 +6,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-black?logo=apple" alt="Platform: macOS on Apple Silicon">
   <img src="https://img.shields.io/badge/status-playable-brightgreen" alt="Status: playable">
-  <img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT">
+  <img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="License: GPL-3.0">
 </p>
 
 A set of patches and one setup script that build Ocarina of Time (Switch 2) as a native Mac app, tuned for a MacBook Pro with M1 Max. It runs at the game's own resolution with a 2560 × 1440 picture at about 55 to 60 frames a second.
@@ -130,4 +130,6 @@ Known faults:
 
 ## License
 
-MIT, as the engine. See [LICENSE](LICENSE).
+GPL-3.0. See [LICENSE](LICENSE).
+
+The patches carry code from projects under the MIT license, which stays theirs: the engine [seedds/nxnative](https://github.com/seedds/nxnative), the shader translator from Ryujinx, and the frame generation from MacNativeGames. Their notices are in [LICENSES/](LICENSES/).
