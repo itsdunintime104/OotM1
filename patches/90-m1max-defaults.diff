@@ -41,3 +41,16 @@
  static int acs_rt_hit(void);   // the attachments of the pass being opened against the window (enc_r_begin_pass)
  static void acs_close(void) { g_acs_closed |= g_acs_live; }
  static void acs_block(void) { acs_close(); g_acs_block = 1; }
+@@ -10208,10 +10208,10 @@
+     const treg_t *r = &g_treg[id_];
+     if (r->gone) { ++*gone; return 0; }
+     if (!r->view && !tex_storage_live(&r->t)) { ++*gone; *dead = 1; return 0; }
+-    {   // DM_NVN_POOL_RETIRED=1 (default off; ab: alternated with the DM_AB phases): an ID whose texture the game finalized (retired: treg_retire_serial) gets the dummy without a
++    {   // DM_NVN_POOL_RETIRED=1 (default on for Ocarina of Time; ab: alternated with the DM_AB phases): an ID whose texture the game finalized (retired: treg_retire_serial) gets the dummy without a
+         // lookup. Ocarina of Time finalizes a texture only when none of its ID slots holds it any more, so it reads no retired ID; resolving them in every walk put thousands a frame
+         // into g_ghost, whose notes refused every patch and started new epochs at scene changes (submit 29-69 ms a frame). Breath of the Wild reads render targets it finalized (g_ghost): not by default
+-        static int m = -1; if (m < 0) m = sw_mode("DM_NVN_POOL_RETIRED", 0);
++        static int m = -1; if (m < 0) m = sw_mode("DM_NVN_POOL_RETIRED", 1);
+         if (r->retired && sw_on(m)) return 0;
+     }
+     if (!r->view && pool_unwritten_target(&r->t)) return 0;   // dummy until a pass writes it (its new texture is noted: ser_note)

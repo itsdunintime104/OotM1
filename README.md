@@ -85,7 +85,11 @@ The settings window opens when the app starts. Its defaults are the settings tha
 | Hold frames when late | Off | a late frame is shown late rather than held |
 | Performance HUD | Off | turn it on to see the frame rate |
 
-Two host settings are on by default and have no row: the 120 Hz display link (`DM_PRESENT_LINK=2`) and the async compute window (`DM_NVN_ASYNC_CS=1`, runs some of the game's compute work beside its draw passes).
+Three host settings are on by default and have no row:
+
+- the 120 Hz display link (`DM_PRESENT_LINK=2`)
+- the async compute window (`DM_NVN_ASYNC_CS=1`): runs some of the game's compute work beside its draw passes
+- freed-texture IDs get a placeholder (`DM_NVN_POOL_RETIRED=1`): fixes the long slowdowns after scene changes (see [Status](#status))
 
 ## Performance
 
@@ -97,15 +101,25 @@ MacBook Pro 16-inch, M1 Max, 32 GB, macOS 26.6, power adapter connected, High Po
 | Frames a second | about 55 to 60 |
 | GPU busy | about 72 % of the time |
 
+Hyrule Castle Town market, the heaviest place measured so far: frame time median 16.6 to 18.4 ms, 95th percentile 18.3 to 22 ms, about 17.3 ms of GPU time a frame.
+
 The GPU is the limit at this resolution. The work behind these numbers, including what did not help, is in [docs/results.md](docs/results.md).
 
 ## Status
 
-Playable. The numbers above come from the test build this repository reproduces: `setup.sh --tree-only` gives its engine source exactly, plus the 5 default lines of `patches/90-m1max-defaults.diff`. A full build through `setup.sh` has not been run yet.
+Playable. The numbers above come from the test build this repository reproduces: `setup.sh --tree-only` gives its engine source exactly (checked on 12 Nov), plus the 6 default settings of `patches/90-m1max-defaults.diff`. A full build through `setup.sh` has not been run yet.
+
+Fixed on 12 Nov (`patches/24-scene-changes-and-movie.diff`):
+
+- **Long slowdowns after scene changes.** After a scene change the host looked up thousands of texture slots a frame that point at textures the game had already freed. A small table overflowed, and the host rebuilt its texture table every frame: 29 to 69 ms of CPU a frame, for up to 15 s. The game never reads such a slot, so the host now gives it a placeholder. In the test runs the worst host CPU time a frame fell from 68.7 ms to 8.3 ms. On by default.
+- **Laggy opening movie.** The movie is AV1, which the M1 decodes on the CPU. A slow picture (up to 132 ms) held the game's movie thread, so the movie stopped on one picture. Decoding now runs on its own thread. Pauses over 50 ms fell from 31 to 55 to 1 to 6 per 600 pictures, and the tester called it great.
 
 Known faults:
 
-- Hitches of 95 to 204 ms, a few each minute. The cause is not known yet.
+- **Freezes at the first visit to a place**, up to about 0.7 s. The host builds a new pipeline while the frame waits. The second visit does not freeze. A fix that builds them before the first frame is in patch 24, but it needs two lists made from your own game files, which this repository does not ship (`DM_NVN_MESH_SETS`, `DM_NVN_LIB_TWINS`). Without the lists it does nothing.
+- **Hitches of 40 to 200 ms**, where the GPU stops between two frames that are ready. They come with memory pressure: with browsers and chat apps closed, they fell from 4.4 to 0.2 to 0.4 per 1,000 frames. This is a strong sign, not a proof.
+- **Below 60 in the city.** The heaviest places are limited by the GPU. Measuring them is the next step.
+- **A white glow on some textures in the city**, seen by the tester. The cause is not found yet.
 - Below 60 the game moves in whole steps of 1/60 s, so motion can speed up and slow down.
 - Frame generation is experimental.
 - Above 60 frames a second is not possible yet: the game's time step is handed over in whole 1/60 s steps.
@@ -115,11 +129,13 @@ Known faults:
 - **`setup.sh` stops at the check.** It names what is missing and how to install it.
 - **macOS will not open the app.** Sign it once: `codesign -f -s - ~/Applications/OotM1.app` (takes a few minutes).
 - **Low frame rate.** Connect the power adapter and set High Power mode (System Settings → Battery). Close other apps that use the GPU.
+- **Hitches.** Close browsers, chat apps and other apps that use a lot of memory. The game uses up to 16 GB of GPU memory in the city, and on a 32 GB Mac the rest can push it into swap.
 - **The log.** The game's log is in `~/Library/Logs/nxnative/`, replaced at each start; the run before is kept as `.prev.log`.
 
 ## Building and development
 
 - `patches/series` lists the patches in order. Patches that carry upstream code with game code references are not stored here: `setup.sh` makes them from upstream pull requests and commits at pinned commits and checks their SHA-256 (`patches/upstream.tsv`). Where the tested patch differs from the public one, a `fixup-*.diff` in `patches/` holds only the difference.
+- `patches/23-test-tree-local-edits.diff` and `patches/24-scene-changes-and-movie.diff` hold the M1 Max work. Patch 24 also adds diagnostics to the log: `DM_NVN_GPUPROF=slow:<ms>` prints the per-pass GPU times of frames that take at least that long, a `[paging]` line reports swap and page-ins, and the movie decoder reports its pauses every 600 pictures.
 - `patches/90-m1max-defaults.diff` holds the default settings above.
 - Each host change can be switched with its environment variable in `env.txt`, in the game's folder under `~/Library/Application Support/nxnative/`, one `NAME=value` per line.
 
