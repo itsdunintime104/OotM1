@@ -1,0 +1,941 @@
+diff --git a/dm/games/0400486024DEC000/README.md b/dm/games/0400486024DEC000/README.md
+--- a/dm/games/0400486024DEC000/README.md
++++ b/dm/games/0400486024DEC000/README.md
+@@ -120,6 +120,18 @@
+ - Resolved: dotted horizontal rows across the picture in play, in fog and light (GitHub issue 1537): the agl_ndsr_vr networks' HMMA calls outside a chain overwrote an accumulator a chain held ([An HMMA outside a chain overwrote the chain's accumulator](../../../docs/reference/shaders.md#an-hmma-outside-a-chain-overwrote-the-chains-accumulator)), since chain 23a1ea1db092; found by bisecting chains on the Kokiri Forest autosave (0f510fd5's chain clean, bd9f422d's not). Under the game's upscaler they had also grown into white blotches: [LDSM reads rows other lanes stored](../../../docs/reference/shaders.md#ldsm-reads-rows-other-lanes-stored).
+ - No iOS shader build or iPhone run has been done. Its memory use makes an iPhone unlikely as it stands.
+ 
++## Unused border corrections
++
++Specialize unused sampler border corrections away ([mechanism](../../../docs/reference/rendering.md#unused-border-corrections-retain-sample-registers)). No sampler of this game needs a twin (no "border colour … Metal lacks" line, the mask 0 in every draw of a profiled frame), so every draw takes the specialization and the picture does not change. Measured on a MacBook Air M4, docked at render scale 0.75 (1920×1080), whole GPU, a window, in the fixed view of Hyrule Field with the most grass (`still.sh`), with the 264 render-stage shaders of that scene that sample through the corrections rebuilt in the new form beside the chain `971e0669b443` image and a host of that chain:
++
++- In-process A/B (`DM_AB DM_NVN_BORDER_KEEP=ab`, the same process, scene and temperature): GPU per frame 25.20 ms specialized against 26.69 and 26.79 ms with the corrections, about 1.5 ms, in the render stages; with the kernels too, a mean of 24.73 ms over five phases against 26.54 ms over four, 1.8 ms.
++- Separate runs, interleaved: 26.48 and 27.10 ms with the corrections, 26.00 and 25.46 ms specialized (thermal drift between runs is about 0.6 ms).
++- The earlier test-only experiment, every twin sample removed from all 301 shaders including 37 kernels, gave 24.97 ms against a four-run mean of 26.36 ms.
++
++The prewarm built the 551 specialized bases of that scene in 11 s at the start, on background threads, before the measured frames. The offline archive of a full conversion holds them (`pso_offline.py`): a test archive of 24 scene pairs, 20 of them with a specialized pixel function, served all 24 to the host's descriptors.
++
++Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 ms more (GPU per frame 25.09 and 25.24 ms with their corrections, 24.97 and 24.86 ms without, interleaved runs; their compute encoders 0.3 ms faster in the profiled frames). Chain `da29694f3f98` contains the change for every stage; a full shader conversion with it is pending, and so is the target of at least 55 fps at these settings.
++
+ ## Found on this game
+ 
+ - [The 60 Hz link at 40 fps in fullscreen on a ProMotion screen](../../../docs/reference/frame-rate.md#the-60-hz-link-at-40-fps-in-fullscreen-on-a-promotion-screen): 40 fps in fullscreen on an M5 Pro MacBook Pro with the GPU at 10 ms of the 16.7, every present one 120 Hz refresh late and every other display-link tick skipped; the screen's fixed 60 Hz mode held 60.0 fps there and fullscreen now switches to it, with the 120 Hz link (59 fps) for screens with no such mode.
+@@ -131,6 +143,7 @@
+ - [Frame-step stubs placed by their function](../../../docs/reference/rewriter.md#frame-step-stubs-placed-by-their-function)
+ - [Repository patches missing under bracketed paths](../../../docs/reference/rewriter.md#repository-patches-missing-under-bracketed-paths): resolved, a build in a folder named with brackets lost this game's frame-step stubs and cuts without an error.
+ - [Retired pool buffers pile up while a game submits nothing](../../../docs/reference/memory.md#retired-pool-buffers-pile-up-while-a-game-submits-nothing): out of focus GPU allocated went from 11 to 20 GB in 12 s with swap following (PR #1392); the likely cause of a session that stayed frozen after a window switch. Not reproduced on the village-deck route (2026-11-09, M6): 40 s out of focus, during the load or standing on the deck, made no pool deletions at all, so the scene that remakes a virtual pool's runs out of focus is still to be found.
++- [Unused border corrections retain sample registers](../../../docs/reference/rendering.md#unused-border-corrections-retain-sample-registers): about 1.5 ms of GPU a frame at 1080p ([measurements](#unused-border-corrections)).
+ 
+ - [Position invariance across shaders](../../../docs/reference/shaders.md#position-invariance-across-shaders): white shapes on plants and bushes for single frames in Kokiri Forest, from the foliage's mesh pre-pass and mesh colour pass rounding the position apart.
+ - [gl_FragCoord.z against the depth stored for its own surface](../../../docs/reference/shaders.md#gl_fragcoordz-against-the-depth-stored-for-its-own-surface): the dark specks flickering in the ground mist (long-standing). The mist's own depth test (`5ad65c0eefd09c7f`, against its depth-only pass `4757b5b373a5406e`) rejected its own surface where Apple's GPU stored the depth one ulp under the fragment's z. Bisected by dropping fragment shaders: after mesh draws took the drop too (`skip_fs_draw`), the specks went with the mist or its depth-only pass, and when that pass wrote `[[position]].z` as depth. Resolved by the rewrite: no specks in play with its 39 rewritten shaders as an overlay (the player's check, 2026-11-09); a full library build on the new chain has not been run.
+diff --git a/dm/gfx/nvn/dmsh_abi.h b/dm/gfx/nvn/dmsh_abi.h
+--- a/dm/gfx/nvn/dmsh_abi.h
++++ b/dm/gfx/nvn/dmsh_abi.h
+@@ -109,6 +109,9 @@
+ #define DMSH_BORDER_K 0x10               // byte offset of sampler bit i's factors k (a float4) in the block: DMSH_BORDER_K + 16 i
+ #define DMSH_BORDER_TWIN "_w"            // the suffix of a twin sampler member's name
+ #define DMSH_BORDER_MEMBER "dm_border"   // the name of the block's member in the argument buffer
++// The corrections' function constant (bool, every stage): true turns them off, for a pipeline whose draw or dispatch binds no sampler with a
++// twin (nvn_mtl.m border_need, bd_off, cs_fn). The twin samples go, and the registers they kept: Ocarina of Time's 1080p material passes spilled 300-400 bytes a thread with them. Undefined, every sample corrects as its bit says
++#define DMSH_BORDER_FC 216
+ // The logic operation's state (dm/gfx/tools/dmsh_logic.py, the _l entry points of the <key>_bx libraries): uint operation (NVN_LOGIC_OP_*), 12 bytes of padding, a uint4 channel mask per colour target, at this fragment buffer index (nvn_mtl.m lo_bind)
+ #define DMSH_LOGIC_BUFFER 29
+ // Its function constants: bool, colour target n is attached (the variant reads it only then), at this index + n (nvn_mtl.m lo_fn specializes the entry point per pass's targets)
+diff --git a/dm/gfx/nvn/dmsh_chain.h b/dm/gfx/nvn/dmsh_chain.h
+--- a/dm/gfx/nvn/dmsh_chain.h
++++ b/dm/gfx/nvn/dmsh_chain.h
+@@ -1,3 +1,3 @@
+ // Generated file (dm/gfx/tools/dmsh_chain.py --header): the B shader library translation chain version this source tree expects (default options), one for every game;
+ // the host loads only <library dir>/b-<V>/. Run dmsh_chain.py --header after changing the chain's tools and commit this file with the change
+-#define DMSH_CHAIN "3168d5cdfce2"
++#define DMSH_CHAIN "8e11a75020ac"
+diff --git a/dm/gfx/nvn/nvn_geometry.inc b/dm/gfx/nvn/nvn_geometry.inc
+--- a/dm/gfx/nvn/nvn_geometry.inc
++++ b/dm/gfx/nvn/nvn_geometry.inc
+@@ -347,7 +347,7 @@
+     }
+     NvShader *lean = base->geo_lean_v[topology];
+     if (!lean || !lean->geo_slot || lean->geo_vertices != (uint32_t)nvn_geo_width(topology) || lean->geo_invocations != 1) return NULL;
+-    if (!lean->geo_pso && !lean->geo_pso_failed) { NSError *e = nil; lean->geo_pso = [g_dev newComputePipelineStateWithFunction:lean->fn error:&e];
++    if (!lean->geo_pso && !lean->geo_pso_failed) { NSError *e = nil; lean->geo_pso = [g_dev newComputePipelineStateWithFunction:fn_dev(lean->fn) error:&e];
+         if (!lean->geo_pso || lean->geo_pso.maxTotalThreadsPerThreadgroup < 32) { lean->geo_pso = nil; lean->geo_pso_failed = 1; MLOG("[RED] lean geometry compute %s: %s; the full kernel draws", lean->key, e ? e.localizedDescription.UTF8String : "no 32-thread group"); } }
+     if (!lean->geo_pso) return NULL;
+     if (!g_geo_lean_k[2]) {
+@@ -385,6 +385,11 @@
+ }
+ static struct { NvShader *vs, *lean; id<MTLFunction> f; } g_geo_mesh_last;
+ static NSMutableDictionary *g_geo_mesh_runfn;   // a mesh entry → its run twin (dm_mesh_run..., dmsh_mesh.py), or NSNull: none in the library, or its pipeline failed
++// Generated mesh entries inherit the vertex library's constants. Keep their descriptors so fn_dev can materialize defaults or bd_off's specialization, as for shader_load.
++static id<MTLFunction> geo_mesh_entry(id<MTLLibrary> lib, NSString *name) {
++    id<MTLFunction> f = [lib newFunctionWithName:name];
++    return f.functionConstantsDictionary.count ? fn_spec(lib, name, [MTLFunctionConstantValues new], NULL) : fn4_note(f, lib, name, nil);
++}
+ // The mesh entry for this draw's program, or nil (the compute path draws it)
+ static id<MTLFunction> geo_mesh_fn(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
+     if (!geo_mesh_on()) return nil;
+@@ -401,10 +406,10 @@
+         NSString *path = [NSString stringWithFormat:@"%@/%.16s_%.16s_m3.metallib", g_msl_dir, vs->key, lean->key];
+         id<MTLLibrary> lib = lib_from_file(path, NULL);
+         NSString *want = [vs->fn.name isEqualToString:@"main0_z"] ? @"dm_mesh_z" : @"dm_mesh";
+-        f = lib ? [lib newFunctionWithName:want] : nil;
+-        if (lib && !f) for (NSString *nm in lib.functionNames) if ([nm hasPrefix:[want stringByAppendingString:@"_p"]]) { f = [lib newFunctionWithName:nm]; break; }   // fewer triangles a group (dm_mesh_p16)
++        f = lib ? geo_mesh_entry(lib, want) : nil;
++        if (lib && !f) for (NSString *nm in lib.functionNames) if ([nm hasPrefix:[want stringByAppendingString:@"_p"]]) { f = geo_mesh_entry(lib, nm); break; }   // fewer triangles a group (dm_mesh_p16)
+         if (f) { if (!g_geo_mesh_runfn) g_geo_mesh_runfn = [NSMutableDictionary dictionary];   // its run twin: dm_mesh_z_p16 → dm_mesh_run_z_p16
+-            g_geo_mesh_runfn[[NSValue valueWithPointer:(__bridge const void *)f]] = [lib newFunctionWithName:[@"dm_mesh_run" stringByAppendingString:[((id<MTLFunction>)f).name substringFromIndex:7]]] ?: NSNull.null; }
++            g_geo_mesh_runfn[[NSValue valueWithPointer:(__bridge const void *)f]] = geo_mesh_entry(lib, [@"dm_mesh_run" stringByAppendingString:[((id<MTLFunction>)f).name substringFromIndex:7]]) ?: NSNull.null; }
+         static int n; if (f || n++ < 16) MLOG("geometry mesh: vertex %s kernel %s %s", vs->key, lean->key, f ? "has a mesh library" : "has no mesh library (geo_mesh.tsv): the compute path draws it");
+         vs->geo_mesh[k] = f = f ?: NSNull.null;
+     }
+@@ -425,7 +430,7 @@
+     if (!ps) {
+         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, nil, 0);
+         MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
+-        m.meshFunction = fn; m.fragmentFunction = d.fragmentFunction;
++        m.meshFunction = fn_dev(k.border ? fn : bd_off(fn)); m.fragmentFunction = fn_dev(d.fragmentFunction);
+         m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
+         for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
+         m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
+@@ -569,8 +574,8 @@
+ }
+ // The Metal 4 descriptor of a native mesh pipeline, whole: no base with open colour state, as a game has some hundred of them, each with functions of its own. Its depth / stencil
+ // formats are not named (Metal 4 pipelines serve any). nil when a function has no Metal 4 descriptor (fn4_of: the diagnostic fragment overrides)
+-static MTL4MeshRenderPipelineDescriptor *mtk_desc4(MTLRenderPipelineDescriptor *d, NvShader *ts, NvShader *ms, id<MTLFunction> ff) {
+-    MTL4FunctionDescriptor *mf = fn4_of(ms->fn), *of = fn4_of(ts ? ts->fn : ms->mesh_obj), *f4 = fn4_of(ff);
++static MTL4MeshRenderPipelineDescriptor *mtk_desc4(MTLRenderPipelineDescriptor *d, NvShader *ts, NvShader *ms, id<MTLFunction> ff, int border) {
++    MTL4FunctionDescriptor *mf = fn4_of(border ? ms->fn : bd_off(ms->fn)), *of = fn4_of(ts ? (border ? ts->fn : bd_off(ts->fn)) : ms->mesh_obj), *f4 = fn4_of(ff);
+     if (!mf || !of || !f4) return nil;
+     MTL4MeshRenderPipelineDescriptor *m = [MTL4MeshRenderPipelineDescriptor new];
+     m.meshFunctionDescriptor = mf; m.fragmentFunctionDescriptor = f4; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+@@ -592,7 +597,7 @@
+     if (!pso_ds_valid((uint32_t)d.depthAttachmentPixelFormat, (uint32_t)d.stencilAttachmentPixelFormat)) return nil;
+     id<MTLFunction> ff = d.fragmentFunction ?: mtk_nop_fragment();
+     pso4_init();
+-    MTL4MeshRenderPipelineDescriptor *m4 = g_comp4 ? mtk_desc4(d, ts, ms, ff) : nil;
++    MTL4MeshRenderPipelineDescriptor *m4 = g_comp4 ? mtk_desc4(d, ts, ms, ff, k->border) : nil;
+     if (m4) {
+         id<MTLRenderPipelineState> ps = nil; int from_run = 0;
+         ps = arch_lookup(m4, 0, &from_run);   // a period of mesh pipelines alone is a p file (no vertex layout)
+@@ -603,8 +608,8 @@
+         }
+     }
+     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
+-    m.meshFunction = fn_dev(ms->fn); m.fragmentFunction = fn_dev(ff); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+-    m.objectFunction = fn_dev(ts ? ts->fn : ms->mesh_obj); m.payloadMemoryLength = ts ? (ts->mesh_payload + 15u) & ~15u : 16; m.maxTotalThreadsPerObjectThreadgroup = ts ? ts->mesh_threads : 1;
++    m.meshFunction = fn_dev(k->border ? ms->fn : bd_off(ms->fn)); m.fragmentFunction = fn_dev(ff); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
++    m.objectFunction = fn_dev(ts ? (k->border ? ts->fn : bd_off(ts->fn)) : ms->mesh_obj); m.payloadMemoryLength = ts ? (ts->mesh_payload + 15u) & ~15u : 16; m.maxTotalThreadsPerObjectThreadgroup = ts ? ts->mesh_threads : 1;
+     m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
+     for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
+     m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
+@@ -626,6 +631,7 @@
+     if (!raster || !g_mtk.ms || !g_mtk.ms->fn) return nil;
+     NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = raster->sh[1];
+     pso_key k; pso_key_fill(&k, ms, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
++    k.border |= border_need(ts, 3);
+     memset(k.attr, 0, sizeof k.attr); memset(k.attr_hi, 0, sizeof k.attr_hi); memset(k.stream, 0, sizeof k.stream);
+     mtk_bind_key(&k, ts, ms, fs);
+     id ps = hm_get_id(&g_pso_mtk, &k);
+@@ -858,7 +864,7 @@
+     if (lean) gs = lean;
+     uint32_t record = lean ? gs->geo_words : GEO_CAPTURE_WORDS;
+     id<MTLRenderPipelineState> capture = geo_capture_pso(vs); if (!capture) return 0;
+-    if (!gs->geo_pso) { NSError *e = nil; gs->geo_pso = [g_dev newComputePipelineStateWithFunction:gs->fn error:&e];
++    if (!gs->geo_pso) { NSError *e = nil; gs->geo_pso = [g_dev newComputePipelineStateWithFunction:fn_dev(gs->fn) error:&e];   // fn_dev: a kernel that samples has the border corrections' constant (kept)
+         if (!gs->geo_pso) { MLOG("[RED] geometry compute %s: %s", gs->key, e.localizedDescription.UTF8String); return 0; } }
+     if (gs->geo_pso.maxTotalThreadsPerThreadgroup < 32) { MLOG("[RED] geometry kernel cannot run a 32-thread group"); return 0; }
+ 
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -5975,6 +5975,56 @@
+         return dev->fn;
+     }
+ }
++// A second specialization of a function object already in use, on the Metal 4 path. Metal hands out one MTLFunction per function content, device-wide: newFunctionWithName: on the same
++// library, or on another library loaded from the same data, returns the same object (macOS 27.2, M4). The host keys a specialization by its function object (fn4_note, fn_dev, pbase_key),
++// so noting other constants on that object would change the pipelines of every draw that uses it. This proxy is a distinct object for the new constants: fn4_note gives it its descriptor
++// and fn_dev its MTLDevice specialization, and every other message (name, reflection) goes to the base function. Metal never builds from it: Metal 4 pipelines take the descriptor, and
++// every MTLDevice pipeline takes its functions through fn_dev, as an unspecialized function with constants needs anyway
++@interface FnVariant : NSProxy { @public id<MTLFunction> base; } @end
++@implementation FnVariant
++- (id)forwardingTargetForSelector:(SEL)s { return base; }
++- (NSMethodSignature *)methodSignatureForSelector:(SEL)s { return [(NSObject *)base methodSignatureForSelector:s]; }
++- (void)forwardInvocation:(NSInvocation *)i { [i invokeWithTarget:base]; }
++@end
++// Keep every prior specialization (alpha test, logic operation, merged outputs) and turn off only the border corrections. Cached by the descriptor f's constants were noted with
++// (fn4_of), not by f: Metal's shared function objects can be noted again. Compilation holds the entry's monitor, never the map lock. A failed specialization keeps the original, correct function.
++static os_unfair_lock g_bd_lock = OS_UNFAIR_LOCK_INIT;
++static NSMapTable *g_bd_fn;   // MTL4FunctionDescriptor → FnDev (fn: the function without the corrections)
++static id<MTLFunction> bd_off(id<MTLFunction> f) {
++    MTL4FunctionDescriptor *fd = fn4_of(f);
++    if (!fd) return f;   // no library to specialize from (diagnostic overrides)
++    os_unfair_lock_lock(&g_bd_lock);
++    if (!g_bd_fn) g_bd_fn = [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory capacity:0];
++    FnDev *entry = [g_bd_fn objectForKey:fd];
++    if (!entry) { entry = [FnDev new]; [g_bd_fn setObject:entry forKey:fd]; }
++    os_unfair_lock_unlock(&g_bd_lock);
++    @synchronized(entry) {
++        if (entry->fn) return entry->fn;
++        MTLFunctionConstantValues *cv = nil;
++        if ([fd isKindOfClass:MTL4SpecializedFunctionDescriptor.class]) {
++            MTL4SpecializedFunctionDescriptor *sd = (MTL4SpecializedFunctionDescriptor *)fd;
++            cv = [sd.constantValues copy]; fd = sd.functionDescriptor;
++        }
++        if (![fd isKindOfClass:MTL4LibraryFunctionDescriptor.class]) return entry->fn = f;
++        MTL4LibraryFunctionDescriptor *ld = (MTL4LibraryFunctionDescriptor *)fd;
++        if (![ld.library newFunctionWithName:ld.name].functionConstantsDictionary[@"dm_border_off"]) return entry->fn = f;   // the entry's, not f's: a specialized f lists no constants
++        if (!cv) cv = [MTLFunctionConstantValues new];
++        BOOL yes = YES; [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BORDER_FC];
++        if (!pso4_compiler()) {   // MTLDevice pipelines: the specialized function, a distinct object
++            NSError *e = nil; entry->fn = fn_lib_spec(ld.library, ld.name, cv, &e);
++            if (!entry->fn) { MLOG("[RED] function %s: disabling unused border corrections failed: %s", f.name.UTF8String, e.localizedDescription.UTF8String); entry->fn = f; }
++            return entry->fn;
++        }
++        FnVariant *v = [FnVariant alloc]; v->base = f;
++        id<MTLFunction> vf = (id<MTLFunction>)v;
++        fn4_note(vf, ld.library, ld.name, cv);
++        os_unfair_lock_lock(&g_fn_dev_lock);
++        if (!g_fn_dev) g_fn_dev = [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory capacity:0];
++        [g_fn_dev setObject:[FnDev new] forKey:vf];
++        os_unfair_lock_unlock(&g_fn_dev_lock);
++        return entry->fn = vf;
++    }
++}
+ static id<MTLComputePipelineState> cps_new(id<MTLFunction> f, NSError **e);   // a compute shader's pipeline: from the archive bundled with the app, else built
+ // layer: a vertex shader's layer entry points (entry_layer / entry_layer_z, which also write the layer) instead of main0 / main0_z, for a program whose geometry shader is a slice writer (prog_fold_gs)
+ static NvShader *shader_load(NSString *pc, int stage, int layer) {
+@@ -6054,13 +6104,13 @@
+     if (stage == 1 && j[@"entry_m"]) { o->fn_m = fn4_note([lib newFunctionWithName:j[@"entry_m"]], lib, j[@"entry_m"], nil); o->mask_m = (uint8_t)[j[@"uint_mask_m"] unsignedIntValue];
+         if (!o->fn_m) MLOG("[RED] shader %s: no mixed integer-output entry point %s in its library", pc.UTF8String, [j[@"entry_m"] UTF8String]); }
+     if (stage == 1 && j[@"entry_d"]) { o->fn_d = fn4_note([lib newFunctionWithName:j[@"entry_d"]], lib, j[@"entry_d"], nil); if (!o->fn_d) MLOG("[RED] shader %s: no dual-source entry point %s in its library", pc.UTF8String, [j[@"entry_d"] UTF8String]); }
+-    if (o->fn.functionConstantsDictionary.count) {   // a compute shader with constants has MTLDevice pipelines (cps_new): it is specialized through its library (fn_spec otherwise)
+-        NSError *fe = nil; MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new]; id<MTLFunction> (*spec)(id<MTLLibrary>, NSString *, MTLFunctionConstantValues *, NSError **) = stage == 5 ? fn_lib_spec : fn_spec;
+-        id<MTLFunction> f = spec(lib, entry, cv, &fe);
++    if (o->fn.functionConstantsDictionary.count) {   // a compute shader's pipeline is looked up by this specialized descriptor too (cps_new); the MTLDevice builds it from fn_dev's
++        NSError *fe = nil; MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
++        id<MTLFunction> f = fn_spec(lib, entry, cv, &fe);
+         if (f) o->fn = f; else MLOG("[RED] shader %s: specializing its function constants failed: %s", pc.UTF8String, fe.localizedDescription.UTF8String);
+-        if (o->fn_u) o->fn_u = spec(lib, j[@"entry_u"], cv, &fe);
+-        if (o->fn_m) o->fn_m = spec(lib, j[@"entry_m"], cv, &fe);
+-        if (o->fn_d) o->fn_d = spec(lib, j[@"entry_d"], cv, &fe);
++        if (o->fn_u) o->fn_u = fn_spec(lib, j[@"entry_u"], cv, &fe);
++        if (o->fn_m) o->fn_m = fn_spec(lib, j[@"entry_m"], cv, &fe);
++        if (o->fn_d) o->fn_d = fn_spec(lib, j[@"entry_d"], cv, &fe);
+     }
+     if (o->rf.nb) {
+         o->ae = [o->fn newArgumentEncoderWithBufferIndex:o->rf.abi];
+@@ -6273,6 +6323,8 @@
+ static _Atomic uint64_t g_tser[1 << 20];
+ static samp_par *g_sreg; static uint8_t *g_sreg_ok; static void **g_sview; static uint64_t *g_srid; static int g_nsreg;   // g_sview: sampler ID → MTLSamplerState (retained)
+ static void **g_sview_w; static uint64_t *g_srid_w; static float (*g_sbk)[4];   // a sampler's twin for a border colour Metal lacks (retained, NULL = none) and the shader's factors k (see nvn_border.h)
++static _Atomic int g_border_any;   // a sampler needing corrections has been registered (sticky). Set before its lazy Metal creation, so its very first draw keeps the corrections
++static int border_need(NvShader *sh, int nvn_stage);
+ // Memory pool Finalize: for texture IDs whose registered texture lives on this pool, drop the cached MTLTexture (view or base texture). The cache used to be released only when the ID was registered again,
+ // so a linear texture built directly on a pool kept the whole pool buffer alive (6 to 17 finalized 16 MB pool buffers stayed alive in Engage's title demo). If the ID is still used, the next lookup rebuilds it on the slow path
+ static void treg_drop_im(treg_t *r) { if (r->im) { defer_obj_unref((__bridge id)r->im); CFRelease(r->im); r->im = r->im_of = NULL; r->im_rid = 0; } }   // the image class view (img_fit)
+@@ -6552,6 +6604,8 @@
+     if (g_sview[id_]) { CFRelease(g_sview[id_]); g_sview[id_] = NULL; g_srid[id_] = 0; }
+     if (g_sview_w[id_]) { CFRelease(g_sview_w[id_]); g_sview_w[id_] = NULL; g_srid_w[id_] = 0; }
+     g_sreg[id_] = *sp; g_sreg_ok[id_] = 1;
++    int bn, bw; float k[4]; const uint8_t wrap[3] = {sp->ws, sp->wt, sp->wr};
++    if (nvn_border(sp->border, wrap, sp->reduction, &bn, &bw, k)) atomic_store(&g_border_any, 1);
+     reg_bump(id_, 1);
+     os_unfair_lock_unlock(&g_rmu);
+ }
+@@ -8105,6 +8159,7 @@
+     }
+     #undef ZERO_ATTR
+     d.vertexDescriptor = vd;
++    if (!k->border) { d.vertexFunction = bd_off(d.vertexFunction); d.fragmentFunction = bd_off(d.fragmentFunction); }
+     return d;
+ }
+ // ---- Metal 4 pipelines: a base per pipeline with its colour state unspecialized, a per-game archive of the bases ----
+@@ -8621,8 +8676,9 @@
+ // MTLDevice as before, and compiled again through the Metal 4 compiler into the current flush period on a background queue (arch_harvest), so the next start takes it from the
+ // file that period writes: the MTLDevice's build is the one the system's shader cache serves, the capture compiles it whole (Star Fox's first 5 at its title: 1.2 ms in all
+ // through the MTLDevice, 95 ms through the capture), so the dispatch never waits for the capture. Before, such a pipeline was built again at every start, and in full at each
+-// one after the system's shader cache dropped it. Not looked up and not captured: a function with constants (fn_lib_spec specializes it through its library) and the embedded
+-// kernels, which have no note. A miss costs a lookup of a fraction of a millisecond per file. g_cps_arch, g_cps_run, g_cps_built: compute pipelines taken from the
++// one after the system's shader cache dropped it. A function with constants is looked up and captured by its specialized descriptor (fn_spec; bd_off's, without the border corrections,
++// which pso_offline.py builds into the bundle), and built through the MTLDevice from the specialization fn_dev makes. Not looked up and not captured: the embedded kernels, which have no
++// note. A miss costs a lookup of a fraction of a millisecond per file. g_cps_arch, g_cps_run, g_cps_built: compute pipelines taken from the
+ // bundle, from this device's files, built (the prewarm's last lines); g_cps_look_ns, g_cps_build_ns: the time looking up, building
+ static _Atomic uint64_t g_cps_arch, g_cps_run, g_cps_built, g_cps_look_ns, g_cps_build_ns;
+ static void arch_note_new(void);
+@@ -8649,10 +8705,19 @@
+         }
+     } });
+ }
++// A function the border corrections' constant specializes: its compute pipeline is in the bundle and the archive by that descriptor. Any other function with constants is built
++// from fn_dev's specialization and is not looked up or captured
++static int fd_border_fc(MTL4FunctionDescriptor *fd) {
++    if (![fd isKindOfClass:MTL4SpecializedFunctionDescriptor.class]) return 0;
++    MTL4FunctionDescriptor *ld = ((MTL4SpecializedFunctionDescriptor *)fd).functionDescriptor;
++    if (![ld isKindOfClass:MTL4LibraryFunctionDescriptor.class]) return 0;
++    MTL4LibraryFunctionDescriptor *l = (MTL4LibraryFunctionDescriptor *)ld;
++    return [l.library newFunctionWithName:l.name].functionConstantsDictionary[@"dm_border_off"] != nil;
++}
+ static id<MTLComputePipelineState> cps_new(id<MTLFunction> f, NSError **e) {
+     pso4_init();
+     MTL4FunctionDescriptor *fd = fn4_of(f); MTL4ComputePipelineDescriptor *d = nil; id<MTLComputePipelineState> ps = nil; uint64_t t0 = bp_now();
+-    if ([fd isKindOfClass:MTL4LibraryFunctionDescriptor.class]) {
++    if ([fd isKindOfClass:MTL4LibraryFunctionDescriptor.class] || fd_border_fc(fd)) {   // a specialized one: fn_spec's or bd_off's, of a function with the border constant
+         d = [MTL4ComputePipelineDescriptor new]; d.computeFunctionDescriptor = fd;
+         if (g_arch_bundle && (ps = [g_arch_bundle newComputePipelineStateWithDescriptor:d error:nil])) atomic_fetch_add(&g_cps_arch, 1);
+         else { int from_run = 0; if ((ps = arch_lookup(d, 1, &from_run))) {   // arch_capture_cs writes them to plain files only
+@@ -8663,7 +8728,7 @@
+         if (ps) return ps;
+     }
+     uint64_t t1 = bp_now();
+-    ps = [g_dev newComputePipelineStateWithFunction:f error:e];
++    ps = [g_dev newComputePipelineStateWithFunction:fn_dev(f) error:e];
+     if (ps) { atomic_fetch_add(&g_cps_built, 1); atomic_fetch_add(&g_cps_build_ns, bp_now() - t1); arch_harvest(d, 0); }
+     return ps;
+ }
+@@ -8905,6 +8970,7 @@
+     k->blend_en = S.color.blend_en; k->chmask = S.chmask.mask; k->a2c = S.ms.a2c; k->atest = atest_key(fs, cfmt, lmap ? g_pso_lmap : NULL);
+     for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) k->blend[i] = S.blend[i];
+     k->logic = lop_key(k, fs, lmap);
++    k->border = border_need(vs, vs->stage) || border_need(fs, 1);
+     const nvn_refl *rf = &vs->rf;
+     for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 32 && a < S.nattr) { if (a < 16) k->attr[a] = S.attr[a]; else k->attr_hi[a - 16] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
+     pso_key_norm(k, lmap);
+@@ -9024,7 +9090,7 @@
+ static MTLRenderPipelineDescriptor *pso_desc_pull(const pso_key *k, NvShader *vs, NvShader *fs) {   // pso_desc's pipeline with the pulling entry point and no vertex descriptor
+     id<MTLFunction> pf = pull_fn(vs); if (!pf) return nil;
+     MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0);
+-    d.vertexFunction = pf; d.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
++    d.vertexFunction = k->border ? pf : bd_off(pf); d.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
+     return d;
+ }
+ static __unsafe_unretained id<MTLRenderPipelineState> hybrid_get(const pso_key *k, NvShader *vs, NvShader *fs) {
+@@ -9107,11 +9173,13 @@
+     if ([head isEqualToString:pre_fail_head(want)]) return pairs;
+     *other = 1; return @{};
+ }
+-static MTL4FunctionDescriptor *pre_fn(id<MTLLibrary> lib, NSString *name) {   // as shader_load notes them (fn4_note): constants specialized with an empty set
++static MTL4FunctionDescriptor *pre_fn(id<MTLLibrary> lib, NSString *name) {   // the common draw's specialization: defaults, with unused border corrections off (bd_off)
+     id<MTLFunction> f = [lib newFunctionWithName:name]; if (!f) return nil;
+     MTL4LibraryFunctionDescriptor *ld = [MTL4LibraryFunctionDescriptor new]; ld.library = lib; ld.name = name;
+     if (!f.functionConstantsDictionary.count) return ld;
+-    MTL4SpecializedFunctionDescriptor *sd = [MTL4SpecializedFunctionDescriptor new]; sd.functionDescriptor = ld; sd.constantValues = [MTLFunctionConstantValues new]; return sd;
++    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
++    if (f.functionConstantsDictionary[@"dm_border_off"]) { BOOL yes = YES; [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BORDER_FC]; }
++    MTL4SpecializedFunctionDescriptor *sd = [MTL4SpecializedFunctionDescriptor new]; sd.functionDescriptor = ld; sd.constantValues = cv; return sd;
+ }
+ static NSDictionary *pre_json(NSString *key) { NSData *d = msl_data([NSString stringWithFormat:@"%@/%@_b.json", g_msl_dir, key]); return d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil; }
+ // The base of one pair as the draws make it (pso_desc_pull / pso_desc), or nil when the pair is left to the draws. Call inside an autorelease pool
+@@ -9529,7 +9597,7 @@
+             g_warm_done++; return;
+         }
+         if (t->kind == 2) {
+-            NvShader *cs = warm_shader(t->key, 5); NSError *e = nil; id ps = cs ? cps_new(cs->fn, &e) : nil;
++            NvShader *cs = warm_shader(t->key, 5); NSError *e = nil; id ps = cs ? cps_new(bd_off(cs->fn), &e) : nil;   // the common function (g_cps)
+             if (cs && !ps) MLOG("[RED] background compute pipeline creation failed: %s", e.localizedDescription.UTF8String);
+             if (ps) { WarmItem *item = [WarmItem new]; item->kind = 2; item->key = t->key; item->shader = cs; item->object = ps; warm_enqueue(item); g_warm_cps++; }
+             g_warm_done++; return;
+@@ -10497,6 +10565,34 @@
+     if (b->soff && b->sreg == DMSH_SREG_C2) return (int)(c2_handle(stage, b->soff - 1u) >> 20);
+     return k < 0 ? ubo_samp_id(ubo_bind_handle(stage, b)) : ubo_samp_id(ubo_handle(stage, b->reg, b->off + 8 * k));
+ }
++// The sampler ID a sampler binding reads in the current state: SAMPT the sampler part of a combined handle (texture ID | sampler ID << 20), SAMPU the same with the handle in a uniform buffer,
++// SAMPI a sampler ID the shader names as a constant
++static int bind_sid(int nvn_stage, const nvn_rbind *b) {
++    int reg = b->reg;
++    return b->kind == NVN_RB_SAMPU ? sampu_id(nvn_stage, b, -1) :
++           b->kind == NVN_RB_SAMPI ? reg : b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(S.tex[nvn_stage][reg] >> 20) : 0) : reg < 128 ? (int)(S.samp[nvn_stage][reg] >> 20) : 0;
++}
++// Whether a draw of sh binds a sampler with a twin (dmsh_build.py border_emu, nvn_border.h), whose samples it must correct: then its pipeline keeps the corrections (pso_key.border),
++// otherwise it is specialized without them (bd_off). Inspect the registered parameters: the pipeline is chosen before encode_args creates Metal samplers, including their twins
++// DM_NVN_BORDER_KEEP=1 keeps the corrections in every pipeline (diagnostic: a wrong border colour with the specialization, or its cost: ab with DM_AB)
++static int border_need(NvShader *sh, int nvn_stage) {
++    static int keep = -1; if (keep < 0) keep = sw_mode("DM_NVN_BORDER_KEEP", 0);
++    if (sh && sh->rf.border && sw_on(keep)) return 1;
++    if (!sh || !sh->rf.border || !atomic_load_explicit(&g_border_any, memory_order_relaxed)) return 0;
++    int need = 0;
++    os_unfair_lock_lock(&g_rmu);
++    for (int i = 0; i < sh->rf.nb && !need; i++) {
++        const nvn_rbind *b = &sh->rf.b[i];
++        if (!b->bw || (b->kind != NVN_RB_SAMP && b->kind != NVN_RB_SAMPT && b->kind != NVN_RB_SAMPU && b->kind != NVN_RB_SAMPI)) continue;
++        int sid = bind_sid(nvn_stage, b);
++        if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) {
++            const samp_par *p = &g_sreg[sid]; int bn, bw; float k[4]; const uint8_t wrap[3] = {p->ws, p->wt, p->wr};
++            need = nvn_border(p->border, wrap, p->reduction, &bn, &bw, k);
++        }
++    }
++    os_unfair_lock_unlock(&g_rmu);
++    return need;
++}
+ // A table of the handles in one of the game's uniform buffers, which a shader indexes at run time (element k = the handle at off + 8k): nothing tells how many the game keeps there, and the argument
+ // buffer has one pointer for it, so the table is as long as the last handle the buffer holds. Kirby Air Riders keeps 197 handles up to element 392 in a 4,096-element buffer, and 34,000 textures
+ // registered: only those a table names are made here, where pool_gpu's walk over every ID took 16 GB and most of the frame. A table is looked at again in each pass, and rebuilt when the handles or the
+@@ -10701,8 +10797,7 @@
+             }
+             if (!(sh->logged & 4)) { sh->logged |= 4; static int nlog; if (nlog++ < 32) MLOG("shader %s (stage %d): an array of %d handles in uniform slot %d, elements %#llx hold textures", sh->key, nvn_stage, b->n, reg, (unsigned long long)real); }
+         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT || b->kind == NVN_RB_SAMPU || b->kind == NVN_RB_SAMPI) {   // SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20); SAMPU: the same, with the handle in a uniform buffer
+-            int sid = b->kind == NVN_RB_SAMPU ? sampu_id(nvn_stage, b, -1) :
+-                      b->kind == NVN_RB_SAMPI ? (int)reg : b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(S.tex[nvn_stage][reg] >> 20) : 0) : reg < 128 ? (int)(S.samp[nvn_stage][reg] >> 20) : 0;   // SAMPI: a sampler ID the shader names as a constant
++            int sid = bind_sid(nvn_stage, b);
+             __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
+             if (b->bw && ss && g_sview_w[sid]) {   // a twin (dmsh_build.py border_emu) of a sampler whose border colour Metal lacks: the shader corrects its samples
+                 ss = (__bridge id<MTLSamplerState>)g_sview_w[sid]; slots[aid] = g_srid_w[sid];
+@@ -13955,7 +14050,11 @@
+     }
+     if (g_rt_range_pending) { PD("j rt_level_range pass=%llu vc=%u", g_stat_pass, (unsigned)(dw ? dw->count : di->count)); g_rt_range_pending=0; }
+ }
+-static nvn_hmap g_cps = {.klen = sizeof(void *)};
++// Compute pipelines by shader and whether the pipeline is without the border corrections: a dispatch takes that function unless a sampler it binds needs them (border_need, bd_off),
++// as a draw does, and the prewarm builds the common one
++typedef struct { const void *cs; uintptr_t off; } cps_key;
++static nvn_hmap g_cps = {.klen = sizeof(cps_key)};
++static id<MTLFunction> cs_fn(NvShader *cs, int off) { return off ? bd_off(cs->fn) : cs->fn; }
+ // shader_load can return distinct objects for a prefetch and a warm task. The library key is
+ // immutable during a run; the selected entry (including entry_z) distinguishes depth variants.
+ // Both loaders use the library's default function constants. Never equate unnamed test/stub shaders.
+@@ -13995,7 +14094,7 @@
+         } else {
+             NvShader *cs = g_shcache[item->key];
+             if (!cs) { cs = item->shader; if (!g_shcache) g_shcache = [NSMutableDictionary dictionary]; g_shcache[item->key] = cs; }
+-            const void *key = (__bridge const void *)cs;
++            cps_key key = {(__bridge const void *)cs, 1};   // warm_task built the common function, without the border corrections
+             if (!hm_get_id(&g_cps, &key)) { hm_put_id(&g_cps, &key, item->object); g_warm_claim_cps++; }
+         }
+     }
+@@ -14060,11 +14159,12 @@
+     if (dp->ind) { static int once; if (!once++) MLOG("indirect dispatch: first time (the GPU reads the threadgroup counts from %#llx)", (unsigned long long)dp->ind); }
+     NvShader *cs = prog_get(S.cprog)->sh[5];
+     if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
+-    const void *k = (__bridge const void *)cs;
++    int off = !border_need(cs, 5);
++    cps_key k = {(__bridge const void *)cs, (uintptr_t)off};
+     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
+     if (!ps) {
+         if (cs->cps_failed) return;   // the same function fails the same way: asked again at every dispatch, Mario Kart World's refused shaders took 3,138 pipeline builds in 60 s
+-        NSError *e = nil; uint64_t bt = bp_now(); ps = cps_new(cs->fn, &e);
++        NSError *e = nil; uint64_t bt = bp_now(); ps = cps_new(cs_fn(cs, off), &e);
+         g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
+         if (!ps) { cs->cps_failed = 1; MLOG("[RED] failed to create compute pipeline for %s: %s (its dispatches are skipped)", cs->key, e.localizedDescription.UTF8String); return; }
+         pso_record("C\t%s\n", cs->key);
+diff --git a/dm/gfx/nvn/nvn_pso_skey.h b/dm/gfx/nvn/nvn_pso_skey.h
+--- a/dm/gfx/nvn/nvn_pso_skey.h
++++ b/dm/gfx/nvn/nvn_pso_skey.h
+@@ -11,6 +11,8 @@
+     uint32_t atest, logic;   // atest: 1 = drawn with the alpha test, the fragment from the shader's side library <key>_bx (nvn_mtl.m atest_key); last, so a prewarm row written before it reads as 0
+                              // logic: 1 = drawn with a logic operation, the fragment from the side library <key>_bx (lop_key); in what was padding (0 in older rows)
+     va_st attr_hi[16];       // NVN2's attributes 16 to 31 (pso_key_attr); last, so a prewarm row written before them reads as 0
++    uint32_t border, border_spare;   // border: 1 = a sampler the draw binds has a twin, so the shaders keep their border colour corrections (nvn_mtl.m border_need); 0 = specialized without
++                                     // them (bd_off); last, so a prewarm row written before it reads as 0. border_spare keeps the key a whole number of 8-byte words
+ } pso_key;
+ static inline va_st pso_key_attr(const pso_key *k, int a) { return a < 16 ? k->attr[a] : k->attr_hi[a - 16]; }
+ 
+@@ -51,8 +53,8 @@
+ }
+ 
+ static inline int pso_skey_parse(const char *hex, pso_skey *out) {
+-    size_t n = sizeof *out * 2, old1 = n - 2 * sizeof out->k.attr_hi, old = old1 - 2 * (sizeof out->k.atest + sizeof out->k.logic);   // a row from before the high attributes, or also before the alpha test field: the key without them
+-    if (!hex || (strlen(hex) != n && strlen(hex) != old1 && strlen(hex) != old)) return -1;
++    size_t n = sizeof *out * 2, old2 = n - 2 * (sizeof out->k.border + sizeof out->k.border_spare), old1 = old2 - 2 * sizeof out->k.attr_hi, old = old1 - 2 * (sizeof out->k.atest + sizeof out->k.logic);   // a row from before the border field, before the high attributes, or also before the alpha test field: the key without them
++    if (!hex || (strlen(hex) != n && strlen(hex) != old2 && strlen(hex) != old1 && strlen(hex) != old)) return -1;
+     if (strlen(hex) != n) { n = strlen(hex); memset(out, 0, sizeof *out); }
+     uint8_t *p = (uint8_t *)out;
+     for (size_t i = 0; i < n; i += 2) {
+diff --git a/dm/gfx/tests/t_border.m b/dm/gfx/tests/t_border.m
+--- a/dm/gfx/tests/t_border.m
++++ b/dm/gfx/tests/t_border.m
+@@ -38,7 +38,77 @@
+ }
+ 
+ static id<MTLTexture> g_tex;
+-static void gpu_case(id<MTLComputePipelineState> p, int sid, const float B[4], int mask_on) {
++// Pipeline selection happens before lazy Metal sampler creation. Exercise the real registry and bindings without needing a Metal device.
++static void binding_cases(void) {
++    NvShader *sh = [NvShader new]; sh->rf.border = 1; sh->rf.nb = 1;
++    nvn_rbind *b = &sh->rf.b[0]; b->kind = NVN_RB_SAMPT; b->reg = 7; b->bw = 1;
++    samp_par sp = {0}; sp.ws = sp.wt = sp.wr = 5;
++    memcpy(sp.border, (float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 16);
++    CHECK(!border_need(nil, 0) && !border_need(sh, 0), "no shader / no registered custom border needs no correction");
++    mtl_reg_samp(31, &sp);
++    CHECK(!g_sview[31] && !g_sview_w[31], "selection precedes lazy sampler creation");
++    for (int stage = 0; stage < 6; stage++) {
++        S.tex[stage][7] = (uint64_t)31 << 20;
++        CHECK(border_need(sh, stage), "stage %d keeps a custom border on its first draw", stage);
++        S.tex[stage][7] = 0;
++        CHECK(!border_need(sh, stage), "stage %d stops correcting after the sampler is unbound", stage);
++    }
++    b->kind = NVN_RB_SAMP; S.samp[3][7] = (uint64_t)31 << 20;
++    CHECK(border_need(sh, 3) && !border_need(sh, 4), "separate sampler bindings use the task / mesh stage's own state");
++    b->kind = NVN_RB_SAMPU; b->soff = DMSH_C2_SAMP + 7 * DMSH_C2_ROW + 1; b->sreg = DMSH_SREG_C2;
++    CHECK(border_need(sh, 3) && !border_need(sh, 4), "a c2 separate sampler word selects the same border");
++    b->soff = 0; b->kind = NVN_RB_SAMPI; b->reg = 31;
++    CHECK(border_need(sh, 1), "constant sampler ID keeps its custom border");
++    b->bw = 0; CHECK(!border_need(sh, 1), "a sample without an emulated twin does not specialize the pipeline"); b->bw = 1;
++    sh->rf.border = 0; CHECK(!border_need(sh, 1), "a shader without border emulation needs no correction"); sh->rf.border = 1;
++    memset(sp.border, 0, 16); mtl_reg_samp(31, &sp);
++    CHECK(!border_need(sh, 1), "re-registering the same ID with a native Metal colour removes the need");
++    memcpy(sp.border, (float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 16); mtl_reg_samp(31, &sp);
++    CHECK(border_need(sh, 1), "re-registering the ID with a custom colour restores the need");
++    sp.ws = sp.wt = sp.wr = 0; mtl_reg_samp(31, &sp);
++    CHECK(!border_need(sh, 1), "wrapping without a border needs no correction");
++    sp.ws = sp.wt = sp.wr = 5; sp.reduction = 1; mtl_reg_samp(31, &sp);
++    CHECK(!border_need(sh, 1), "min reduction keeps its existing nearest-colour behavior");
++    b->reg = g_nsreg + 1; CHECK(!border_need(sh, 1), "an unregistered sampler needs no correction");
++    S.samp[3][7] = 0;
++}
++// A synthetic kernel makes specialization observable as a word on the GPU. Production kernels do not take BORDER_FC; the same host specialization serves render functions.
++// Each case has a kernel of its own content: Metal hands out one function object per content, so one shared kernel would carry the first case's notes into the next
++static void specialization_cases(void) {
++    for (int deferred = 0; deferred < 3; deferred++) {
++        NSString *src = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\n"
++            "constant uint prior [[function_constant(0)]];\nconstant bool dm_border_off [[function_constant(%u)]];\n"
++            "constant bool live = !is_function_constant_defined(dm_border_off) || !dm_border_off;\n"
++            "constant uint kept = is_function_constant_defined(prior) ? prior : 13u;\n"
++            "kernel void probe(device uint *out [[buffer(0)]]) { out[0] = kept + uint(live); out[1] = %du; }\n", (unsigned)DMSH_BORDER_FC, deferred];
++        NSError *error = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&error];
++        CHECK(lib != nil, "specialization fixture compiles: %s", error.localizedDescription.UTF8String);
++        if (!lib) return;
++        MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new]; uint32_t prior = deferred == 2 ? 13 : 23;
++        [cv setConstantValue:&prior type:MTLDataTypeUInt atIndex:0];
++        id<MTLFunction> f = deferred == 2 ? geo_mesh_entry(lib, @"probe") : deferred ? fn_spec(lib, @"probe", cv, &error) : fn_lib_spec(lib, @"probe", cv, &error);
++        CHECK(f != nil, "original specialization exists (%d)", deferred); if (!f) continue;
++        id<MTLFunction> off = bd_off(f);
++        CHECK(off != f && off == bd_off(f), "border specialization is distinct and cached (%d)", deferred);
++        MTL4SpecializedFunctionDescriptor *pre = (MTL4SpecializedFunctionDescriptor *)pre_fn(lib, @"probe");
++        id<MTLFunction> warm = fn_lib_spec(lib, @"probe", pre.constantValues, &error);
++        CHECK(warm != nil, "prewarm specialization exists (%d)", deferred);
++        // Prewarm must choose border-off with other constants at their defaults. The original must survive copying its constants into off unchanged.
++        for (int variant = 2; variant >= 0; variant--) {
++            id<MTLFunction> fn = variant == 2 ? warm : variant == 1 ? off : f; if (!fn) continue;
++            id<MTLComputePipelineState> p = [g_dev newComputePipelineStateWithFunction:fn_dev(fn) error:&error];
++            CHECK(p != nil, "specialized pipeline builds: %s", error.localizedDescription.UTF8String); if (!p) continue;
++            id<MTLBuffer> out = [g_dev newBufferWithLength:8 options:MTLResourceStorageModeShared];
++            id<MTLCommandBuffer> cb = q_cb(); id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
++            [e setComputePipelineState:p]; [e setBuffer:out offset:0 atIndex:0];
++            [e dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)]; [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
++            CHECK(cb.status == MTLCommandBufferStatusCompleted, "specialization GPU work completed");
++            CHECK(*(uint32_t *)out.contents == (variant == 2 ? 13u : prior + (variant == 0)), "prior constant and border match variant %d (%d)", variant, deferred);
++        }
++    }
++}
++// live: the pipeline keeps the corrections (cs_fn without them: Metal's nearest colour whatever the mask)
++static void gpu_case(id<MTLComputePipelineState> p, int live, int sid, const float B[4], int mask_on) {
+     samp_par sp = {0}; sp.magf = 1; sp.minf = 1; sp.ws = sp.wt = sp.wr = 5; sp.lod_max = 0; memcpy(sp.border, B, 16);
+     mtl_reg_samp(sid, &sp);
+     os_unfair_lock_lock(&g_rmu);
+@@ -58,9 +128,9 @@
+     [e useResource:g_tex usage:MTLResourceUsageRead]; [e useResource:block usage:MTLResourceUsageRead];
+     [e dispatchThreads:MTLSizeMake(NUV, 1, 1) threadsPerThreadgroup:MTLSizeMake(NUV, 1, 1)]; [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+     CHECK(cb.status == MTLCommandBufferStatusCompleted, "sampler %d: GPU work completed", sid);
+-    const float *got = out.contents; const float *Bref = mask ? B : nvn_mtl_border[bn];   // the mask clear: Metal's nearest colour
++    const float *got = out.contents; const float *Bref = mask && live ? B : nvn_mtl_border[bn];   // the mask clear, or the corrections compiled out: Metal's nearest colour
+     for (int i = 0; i < NUV; i++) { float ref[4]; reference(Bref, UV[i][0], UV[i][1], ref);
+-        for (int c = 0; c < 4; c++) CHECK(fabsf(got[4 * i + c] - ref[c]) < 6e-3f, "border %g,%g,%g,%g mask %u at (%g, %g) channel %d: %g, expected %g", B[0], B[1], B[2], B[3], mask, UV[i][0], UV[i][1], c, got[4 * i + c], ref[c]); }
++        for (int c = 0; c < 4; c++) CHECK(fabsf(got[4 * i + c] - ref[c]) < 6e-3f, "border %g,%g,%g,%g mask %u live %d at (%g, %g) channel %d: %g, expected %g", B[0], B[1], B[2], B[3], mask, live, UV[i][0], UV[i][1], c, got[4 * i + c], ref[c]); }
+ }
+ 
+ int main(int argc, char **argv) { @autoreleasepool {
+@@ -72,25 +142,36 @@
+     choice((float[4]){0, 0, 0, 0}, 5, 0, 0, 0); choice((float[4]){0, 0, 0, 1}, 5, 0, 0, 1); choice((float[4]){1, 1, 1, 1}, 5, 0, 0, 2);   // Metal's own
+     choice((float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 0, 0, 0, 0);   // the border is never read
+     choice((float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 5, 1, 0, 0);   // a min reduction is not linear in it
++    binding_cases();
++    if (argc > 1 && !strcmp(argv[1], "--cpu")) {
++        printf("t_border (CPU only): %d checks, %d failed\n", checks, fails);
++        return fails != 0;
++    }
+     mtl_init();
++    specialization_cases();
+     if (argc > 1) {   // the rewritten shader
+         NSError *error = nil; NSString *src = [NSString stringWithContentsOfFile:@(argv[1]) encoding:NSUTF8StringEncoding error:&error];
+         id<MTLLibrary> lib = src ? [g_dev newLibraryWithSource:src options:nil error:&error] : nil;
+-        id<MTLComputePipelineState> p = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"main0"] error:&error] : nil;
+-        CHECK(p != nil, "the rewritten shader compiles: %s", error.localizedDescription.UTF8String);
+-        if (p) {
++        // as shader_load and dispatch take a compute shader: specialized with the empty set (the corrections), and without them (cs_fn, bd_off), each through cps_new
++        NvShader *cs = [NvShader new]; cs->fn = lib ? fn_spec(lib, @"main0", [MTLFunctionConstantValues new], &error) : nil;
++        id<MTLComputePipelineState> p = cs->fn ? cps_new(cs_fn(cs, 0), &error) : nil, p_off = cs->fn ? cps_new(cs_fn(cs, 1), &error) : nil;
++        CHECK(p != nil && p_off != nil, "the rewritten shader compiles: %s", error.localizedDescription.UTF8String);
++        CHECK(cs_fn(cs, 1) != cs->fn && cs_fn(cs, 1) == cs_fn(cs, 1), "the kernel's border-off function is its own, and cached");
++        if (p && p_off) {
+             MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:W height:H mipmapped:NO];
+             d.storageMode = MTLStorageModeShared; g_tex = [g_dev newTextureWithDescriptor:d];
+             float px[H][W][4]; for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) for (int c = 0; c < 4; c++) px[y][x][c] = texel(x, y, c);
+             [g_tex replaceRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0 withBytes:px bytesPerRow:16 * W];
+             if (![g_dev supports32BitFloatFiltering]) { fprintf(stderr, "t_border: this GPU does not filter RGBA32Float, GPU cases skipped\n"); }
+             else {
+-                gpu_case(p, 11, (float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 1);
+-                gpu_case(p, 11, (float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 0);
+-                gpu_case(p, 12, (float[4]){0.25f, 0.5f, 0.75f, 1}, 1);
+-                gpu_case(p, 12, (float[4]){0.25f, 0.5f, 0.75f, 1}, 0);
+-                gpu_case(p, 13, (float[4]){0.8f, 0.9f, 0.7f, 0.6f}, 1);
+-                gpu_case(p, 14, (float[4]){0, 0, 0, 1}, 1);   // Metal's own: no twin, the plain sample
++                gpu_case(p, 1, 11, (float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 1);
++                gpu_case(p, 1, 11, (float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 0);
++                gpu_case(p, 1, 12, (float[4]){0.25f, 0.5f, 0.75f, 1}, 1);
++                gpu_case(p, 1, 12, (float[4]){0.25f, 0.5f, 0.75f, 1}, 0);
++                gpu_case(p, 1, 13, (float[4]){0.8f, 0.9f, 0.7f, 0.6f}, 1);
++                gpu_case(p, 1, 14, (float[4]){0, 0, 0, 1}, 1);   // Metal's own: no twin, the plain sample
++                gpu_case(p_off, 0, 11, (float[4]){0.5f, 0.5f, 0.5f, 0.5f}, 1);   // the corrections compiled out: the mask set, still the nearest colour
++                gpu_case(p_off, 0, 12, (float[4]){0.25f, 0.5f, 0.75f, 1}, 1);
+             }
+         }
+     }
+diff --git a/dm/gfx/tests/t_pso_skey.m b/dm/gfx/tests/t_pso_skey.m
+--- a/dm/gfx/tests/t_pso_skey.m
++++ b/dm/gfx/tests/t_pso_skey.m
+@@ -33,9 +33,9 @@
+         NvShader *vs = [NvShader new]; snprintf(vs->key, sizeof vs->key, "vs-a");
+         pso_skey a, b; char hex[sizeof a * 2 + 1];
+         pso_skey_from(&k, vs, nil, 0, NULL, &a); pso_skey_hex(&a, hex);
+-        size_t old = strlen(hex) - 2 * (sizeof k.attr_hi + sizeof k.atest + sizeof k.logic); hex[old] = 0;
++        size_t old = strlen(hex) - 2 * (sizeof k.attr_hi + sizeof k.atest + sizeof k.logic + sizeof k.border + sizeof k.border_spare); hex[old] = 0;
+         assert(pso_skey_parse(hex, &b) == 0); assert(b.k.atest == 0 && b.k.logic == 0);
+-        a.k.atest = a.k.logic = 0; memset(a.k.attr_hi, 0, sizeof a.k.attr_hi); assert(memcmp(&a, &b, sizeof a) == 0);
++        a.k.atest = a.k.logic = a.k.border = a.k.border_spare = 0; memset(a.k.attr_hi, 0, sizeof a.k.attr_hi); assert(memcmp(&a, &b, sizeof a) == 0);
+     }
+     // A row written before pso_key.attr_hi (NVN2's vertex attributes 16 to 31): they read as 0, the fields before them stay
+     {
+@@ -43,9 +43,20 @@
+         NvShader *vs = [NvShader new]; snprintf(vs->key, sizeof vs->key, "vs-h");
+         pso_skey a, b; char hex[sizeof a * 2 + 1];
+         pso_skey_from(&k, vs, nil, 0, NULL, &a); pso_skey_hex(&a, hex);
+-        hex[strlen(hex) - 2 * sizeof k.attr_hi] = 0;
++        hex[strlen(hex) - 2 * (sizeof k.attr_hi + sizeof k.border + sizeof k.border_spare)] = 0;
+         assert(pso_skey_parse(hex, &b) == 0); assert(b.k.atest == 1 && b.k.logic == 1);
+-        memset(a.k.attr_hi, 0, sizeof a.k.attr_hi); assert(memcmp(&a, &b, sizeof a) == 0);   // NOLINT(bugprone-suspicious-memory-comparison): the key is defined byte by byte, padding included: pso_skey_from clears it and its hex form is every byte
++        a.k.border = a.k.border_spare = 0; memset(a.k.attr_hi, 0, sizeof a.k.attr_hi); assert(memcmp(&a, &b, sizeof a) == 0);   // NOLINT(bugprone-suspicious-memory-comparison): the key is defined byte by byte, padding included: pso_skey_from clears it and its hex form is every byte
++    }
++    // A row written before the border specialization keeps its high attributes and prewarms the no-correction pipeline. Live draws needing corrections have a different key.
++    {
++        pso_key k; fill(&k, 13); pso_key_norm(&k, 0);
++        NvShader *vs = [NvShader new]; snprintf(vs->key, sizeof vs->key, "vs-b");
++        pso_skey a, b; char hex[sizeof a * 2 + 1];
++        pso_skey_from(&k, vs, nil, 0, NULL, &a); pso_skey_hex(&a, hex);
++        hex[strlen(hex) - 2 * (sizeof k.border + sizeof k.border_spare)] = 0;
++        assert(pso_skey_parse(hex, &b) == 0 && b.k.border == 0 && b.k.border_spare == 0);
++        a.k.border = a.k.border_spare = 0; assert(memcmp(&a, &b, sizeof a) == 0);
++        a.k.border = 1; assert(memcmp(&a, &b, sizeof a) != 0);
+     }
+     // pso_key_attr: attribute 16 is the first of the high table
+     {
+diff --git a/dm/gfx/tests/test_dmsh_border.py b/dm/gfx/tests/test_dmsh_border.py
+--- a/dm/gfx/tests/test_dmsh_border.py
++++ b/dm/gfx/tests/test_dmsh_border.py
+@@ -19,7 +19,7 @@
+ tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
+ names = {'border_emu', 'reflect', 'decode_tex', 'decode_ubo_tex', 'decode_ubo_img', 'const_sampler', 'c2_array'}
+ selected = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names)
+-            or (isinstance(n, ast.Assign) and any(getattr(e, 'id', None) in ('BORDER_HELPERS', 'SSBO', 'TEX_BASE') for t in n.targets for e in (t.elts if isinstance(t, ast.Tuple) else [t])))]
++            or (isinstance(n, ast.Assign) and any(getattr(e, 'id', None) in ('BORDER_HELPERS', 'BORDER_LIVE_RT', 'BORDER_LIVE_FC', 'SSBO', 'TEX_BASE') for t in n.targets for e in (t.elts if isinstance(t, ast.Tuple) else [t])))]
+ scope = {'re': re, 'abi': abi, 'dmsh_geometry': dmsh_geometry}
+ exec(compile(ast.Module(body=selected, type_ignores=[]), str(TOOLS / 'dmsh_build.py'), 'exec'), scope)
+ border_emu, reflect = scope['border_emu'], scope['reflect']
+@@ -122,6 +122,14 @@
+         inner = 'dm_bs(spvDescriptorSet0.fp_t_tcb_8.sample(spvDescriptorSet0.fp_t_tcb_8Smplr, _182, level(0.0)), spvDescriptorSet0.dm_border, 0u, spvDescriptorSet0.fp_t_tcb_8, spvDescriptorSet0.fp_t_tcb_8Smplr_w, _182, level(0.0))'
+         self.assertEqual(out.count(inner), 2, 'the inner sample, rewritten, in both of the outer one\'s samples')
+ 
++    def test_stages_and_the_function_constant(self):
++        frag, kern = border_emu(GRASS), border_emu(KERNEL)
++        self.assertIn(f'constant bool dm_border_off [[function_constant({abi.BORDER_FC})]];', frag, 'a fragment shader takes the host\'s specialization (nvn_mtl.m bd_off)')
++        self.assertIn('#define DM_BORDER_LIVE dm_border_live', frag)
++        self.assertIn('if (DM_BORDER_LIVE && (b->mask >> i & 1u))', frag)
++        self.assertIn(f'constant bool dm_border_off [[function_constant({abi.BORDER_FC})]];', kern, 'a kernel too (nvn_mtl.m cs_fn, cps_new by its specialized descriptor)')
++        self.assertIn('#define DM_BORDER_LIVE dm_border_live', kern)
++
+     def test_integer_textures_keep_their_samples(self):
+         out = border_emu(INTEGER)
+         self.assertIn('uint4 _10 = spvDescriptorSet0.fp_t_tcb_8.sample(spvDescriptorSet0.fp_t_tcb_8Smplr, float2(0.5), level(0.0));', out, 'an integer sample is not wrapped')
+diff --git a/dm/gfx/tools/dmsh_build.py b/dm/gfx/tools/dmsh_build.py
+--- a/dm/gfx/tools/dmsh_build.py
++++ b/dm/gfx/tools/dmsh_build.py
+@@ -362,10 +362,16 @@
+ static inline __attribute__((always_inline)) float dm_bmix(float r, float w, float4 k) {{ return r + (w - r) * k.x; }}
+ template<typename V, typename T, typename... A> static inline __attribute__((always_inline)) V dm_bs(V r, constant dm_border_t* b, uint i, T t, sampler w, A... a)
+ {{
+-    if (b->mask >> i & 1u) r = dm_bmix(r, t.sample(w, a...), b->k[i]);
++    if (DM_BORDER_LIVE && (b->mask >> i & 1u)) r = dm_bmix(r, t.sample(w, a...), b->k[i]);
+     return r;
+ }}
+ '''
++# The corrections also depend on the function constant abi.BORDER_FC: the host sets it (true: off) for a pipeline whose draw or dispatch binds no sampler with a twin, the usual case,
++# and the twin samples are compiled out with the registers they kept live (a uniform branch still costs them: Ocarina of Time's 1080p material passes spilled 300-400 bytes a thread,
++# 1.5 ms of a 26.7 ms frame on a MacBook Air M4, and its kernels, NDSR's network among them, 0.25 ms more). A pipeline the host does not specialize leaves it undefined: every sample
++# corrects as before. A kernel's pipeline is looked up by its specialized descriptor (nvn_mtl.m cps_new), and pso_offline.py builds it into the app's archive
++BORDER_LIVE_FC = (f'constant bool dm_border_off [[function_constant({abi.BORDER_FC})]];\n'
++                  'constant bool dm_border_live = !is_function_constant_defined(dm_border_off) || !dm_border_off;\n#define DM_BORDER_LIVE dm_border_live\n')
+ def border_emu(msl):
+     """The samples of the argument buffer's textures through its sampler members, T.sample(S, args) → dm_bs(T.sample(S, args), block, bit, T, S_w, args) (see BORDER_HELPERS);
+     the source unchanged when it samples through none. Only samples of float textures: an integer texture is not filtered, and its border colour is Maxwell's integer one, which
+@@ -393,7 +399,7 @@
+         args = msl[m.end():i - 1]
+         twin = f'spvDescriptorSet0.{m.group(2)}{abi.BORDER_TWIN}'
+         msl = msl[:m.start()] + f'dm_bs({msl[m.start():i]}, spvDescriptorSet0.{abi.BORDER_MEMBER}, {bit[m.group(2)]}u, spvDescriptorSet0.{m.group(1)}, {twin}, {args})' + msl[i:]
+-    return msl.replace('using namespace metal;\n', 'using namespace metal;\n' + BORDER_HELPERS, 1)
++    return msl.replace('using namespace metal;\n', 'using namespace metal;\n' + BORDER_LIVE_FC + BORDER_HELPERS, 1)
+ # gl_FragCoord.z against a depth the shader read. NVIDIA stores a fragment's depth as the z its pixel shader reads, so a shader can test a fragment against a depth image of its own surface and
+ # find them equal. Apple's GPU stores a value below the [[position]].z its fragment shader reads at some pixels: by up to one ulp of z plus a fraction of the depth's step across a pixel
+ # (dm/gfx/tests/t_zsnap.m: 0.2% of a perspective triangle's pixels, 2% of flat ones, none above, the largest gap one ulp plus 2^-23 of fwidth(z)); writing [[position]].z as the depth would
+diff --git a/dm/gfx/tools/pso_offline.py b/dm/gfx/tools/pso_offline.py
+--- a/dm/gfx/tools/pso_offline.py
++++ b/dm/gfx/tools/pso_offline.py
+@@ -8,12 +8,16 @@
+ #   · left out as the host leaves them out (to the draws): a reflection of another chain version or none, a vertex shader with stage inputs and no pulling library, a vertex library that
+ #     writes the layer (render_target_array_index), a pixel shader that reads the primitive ID (its reflection's raster.primitive_id: the host builds its pipelines whole, since
+ #     through a base every primitive reads 0), a missing library or entry point
+-#   · a pair whose functions declare function constants is left to the device (rest_pairs.tsv): the host specializes such functions with an empty set of values, and metal-tt makes
+-#     no specialized function from a library (applegpu-nt: "cannot find private metadata"), nor the function unspecialized ("cannot lower module with unresolved function constants")
++#   · a function that declares function constants is specialized as the host's prebuild specializes it (pre_fn in nvn_mtl.m): the border colour corrections' dm_border_off set (true:
++#     off), the specialization the draws that bind no sampler with a twin share (bd_off). metal-tt specializes a <key>_b or <key>_bp function, cut by dmsh_side.cut or not, and the host
++#     finds that base by its specialized descriptor (checked on Ocarina of Time's libraries, macOS 27.2, metal-tt 32023). It cannot lower a function unspecialized ("cannot lower module
++#     with unresolved function constants"), and failed with "cannot find private metadata" on a side library (<key>_bx), which no base uses. A pair whose functions declare any other
++#     constant is left to the device (rest_pairs.tsv), as before (HOST_CONSTANTS)
+ # And a compute pipeline per compute shader, which depends on its function alone (the host makes it from the function, cps_new in nvn_mtl.m; the threadgroup size is the dispatch's):
+ # the C rows of the profile's prewarm list (pso_manifest.tsv, recorded, in order), then every compute shader of its shader map (shader_map.tsv, stage compute), so a game whose list
+ # names none (a provisional profile) still has them; per shader <key>_b, entry `entry`. Left out as the host would not find them: a reflection of another chain version or none, a
+-# missing library or entry point, a function with function constants (the host specializes it through its library, fn_lib_spec, and builds that pipeline through the MTLDevice)
++# missing library or entry point, a function with a function constant other than HOST_CONSTANTS (the host builds that pipeline through the MTLDevice). One with the border corrections'
++# constant is specialized as for the bases, as the host's common dispatch and its prewarm take it (cps_new, bd_off)
+ # Output folder (what the app bundles as pso/, the host's DM_PSO_BUNDLE):
+ #   <arch>.mtl4a     one archive per GPU architecture (applegpu_g18p = A19 / A19 Pro); the host opens the one named after its device's architecture
+ #   prebuilt.tsv     what the archives cover, in the host's stamp format (pso_prebuild): chain version, depth mode, the pair lists' size and SHA-256. The host skips its prebuild when
+@@ -39,7 +43,13 @@
+ from pathlib import Path
+ 
+ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'tools'))
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ import romfs, shader_lib   # the libraries may be one file (shader_lib.py), read in place; metal-tt alone needs files of its own (real_libraries)
++import dmsh_abi as abi
++
++# The function constants the host's prebuild sets in a base's functions (nvn_mtl.m pre_fn), by name: (index, bool value). A pair whose functions declare another constant is left to the
++# device: the host leaves it at its default, which metal-tt can do too, but no other constant was tried there, and one function metal-tt fails fails its whole group
++HOST_CONSTANTS = {'dm_border_off': (abi.BORDER_FC, True)}
+ 
+ LAYER = b'render_target_array_index'
+ BATCH = 1000   # bases per metal-tt run: Odyssey's largest compiler lifetime footprint at this size was 2.065 GiB on an 8 GB M2
+@@ -88,8 +98,22 @@
+ 
+ 
+ def functions(path):
+-    """{entry name: declares function constants} of a .metallib, from its header: the function list (NAME tags) and each function's public metadata (a CNST tag lists its constants).
+-    Raises ValueError on a file it cannot read"""
++    """{entry name: declares function constants} of a .metallib (constants). Raises ValueError on a file it cannot read"""
++    return {k: bool(v) for k, v in constants(path).items()}
++
++
++def _constant_names(cnst):
++    """The names in a CNST tag: a 16-bit count, then per constant its name (NUL-terminated), a type byte, a 16-bit index and a byte"""
++    n, p, out = struct.unpack_from('<H', cnst, 0)[0], 2, []
++    for _ in range(n):
++        end = cnst.index(b'\0', p); out.append(cnst[p:end].decode()); p = end + 1 + 4
++    if p > len(cnst): raise ValueError('a truncated CNST tag')
++    return tuple(out)
++
++
++def constants(path):
++    """{entry name: the names of the function constants it declares, a tuple, empty for none} of a .metallib, from its header: the function list (NAME tags) and each function's public
++    metadata (a CNST tag lists its constants). Raises ValueError on a file it cannot read"""
+     with romfs.open(path, 'rb') as f: b = f.read(1 << 20)
+     if b[:4] != b'MTLB' or len(b) < 0x58: raise ValueError(f'{path}: not a Metal library')
+     fo, _, po, ps = struct.unpack_from('<QQQQ', b, 0x18)
+@@ -106,9 +130,9 @@
+             size = struct.unpack_from('<I', b, p)[0]; names.append(tags(p + 4, p + size)[b'NAME'].rstrip(b'\0').decode()); p += size
+         consts, p = [], po
+         for _ in range(count):   # each entry: its size (not counting the size field), then tags
+-            size = struct.unpack_from('<I', b, p)[0]; consts.append(b'CNST' in tags(p + 4, p + 4 + size)); p += 4 + size
++            size = struct.unpack_from('<I', b, p)[0]; t = tags(p + 4, p + 4 + size); consts.append(_constant_names(t[b'CNST']) if b'CNST' in t else ()); p += 4 + size
+         if p != po + ps: raise ValueError(f'{path}: public metadata does not match the function list')
+-    except (struct.error, KeyError) as e: raise ValueError(f'{path}: unreadable function list ({e})') from e
++    except (struct.error, KeyError, UnicodeDecodeError) as e: raise ValueError(f'{path}: unreadable function list ({e})') from e
+     return dict(zip(names, consts))
+ 
+ 
+@@ -122,7 +146,7 @@
+         return js[key]
+     def fn(lib):
+         if lib not in fns:
+-            try: fns[lib] = functions(lib_dir / f'{lib}.metallib')
++            try: fns[lib] = constants(lib_dir / f'{lib}.metallib')
+             except (OSError, ValueError): fns[lib] = None
+         return fns[lib]
+     def writes_layer(lib):
+@@ -142,7 +166,7 @@
+         if vf is None or ff is None: left['library'] += 1; continue
+         if writes_layer(vl): left['layer'] += 1; continue
+         if ventry not in vf or fentry not in ff: left['entry'] += 1; continue
+-        if vf[ventry] or ff[fentry]: rest.append((vk, fk)); continue
++        if any(c not in HOST_CONSTANTS for c in vf[ventry] + ff[fentry]): rest.append((vk, fk)); continue   # script specializes HOST_CONSTANTS as the host does
+         b = (vl, ventry, fl, fentry)
+         if b not in seen: seen.add(b); bases.append(b)
+     return bases, rest, left
+@@ -157,30 +181,41 @@
+         except (OSError, ValueError): j = None
+         if not isinstance(j, dict) or j.get('chain') != chain or j.get('stage', 'cs') != 'cs': left['reflection'] += 1; continue
+         entry = j.get('entry') or 'main0'
+-        try: fs = functions(lib_dir / f'{pc}.metallib')
++        try: fs = constants(lib_dir / f'{pc}.metallib')
+         except (OSError, ValueError): left['library'] += 1; continue
+         if entry not in fs: left['entry'] += 1; continue
+-        if fs[entry]: left['constants'] += 1; continue
++        if any(c not in HOST_CONSTANTS for c in fs[entry]): left['constants'] += 1; continue   # script specializes HOST_CONSTANTS, as cps_new looks the pipeline up
+         if (pc, entry) not in seen: seen.add((pc, entry)); pipes.append((pc, entry))
+     return pipes, left
+ 
+ 
+ def script(lib_dir, bases, computes=()):
+     """A Metal 4 pipelines script (metal4-pipelines-script(5), the .mtl4-json format metal-tt reads) with one render pipeline descriptor per base, and one compute pipeline descriptor per
+-    compute pipeline (library, entry) that names the function alone, as the host's lookup does (cps_bundle in nvn_mtl.m: no threadgroup size, no indirect command buffers)"""
+-    libs, fns, pipes = {}, {}, []
++    compute pipeline (library, entry) that names the function alone, as the host's lookup does (cps_bundle in nvn_mtl.m: no threadgroup size, no indirect command buffers).
++    A function that declares constants is named through its specialization by HOST_CONSTANTS (a pair with other constants is not among the bases: plan)"""
++    libs, fns, specs, declared, pipes = {}, {}, {}, {}, []
+     def fd(lib, entry):
+-        if lib not in libs: libs[lib] = {'label': lib, 'path': str(Path(lib_dir).resolve() / f'{lib}.metallib')}
++        if lib not in libs:
++            libs[lib] = {'label': lib, 'path': str(Path(lib_dir).resolve() / f'{lib}.metallib')}
++            try: declared[lib] = constants(romfs.Path(lib_dir) / f'{lib}.metallib')
++            except (OSError, ValueError): declared[lib] = {}   # plan read every base's libraries; one it could not read is not among them
+         label = f'{lib}.{entry}'
+         if label not in fns: fns[label] = {'label': label, 'library': f'lib:{lib}', 'name': entry}
+-        return f'fnd:{label}'
++        cs = declared[lib].get(entry, ())
++        if not cs: return f'fnd:{label}'
++        if label not in specs:
++            specs[label] = {'label': f'{label}.host', 'function_descriptor': f'fnd:{label}',
++                            'constant_values': [{'id_type': 'FunctionConstantIndex', 'id': {'data': i}, 'value_type': 'ConstantBool', 'value': {'data': v}}
++                                                for i, v in sorted(HOST_CONSTANTS[c] for c in cs if c in HOST_CONSTANTS)]}
++        return f'fnd:{label}.host'
+     for vl, ve, fl, fe in bases:
+         pipes.append({'vertex_function_descriptor': fd(vl, ve), 'fragment_function_descriptor': fd(fl, fe),
+                       'color_attachments': [dict.fromkeys(COLOUR, 'Unspecialized') for _ in range(8)]})
+     descriptors = {'render_pipeline_descriptors': pipes}
+     if computes: descriptors['compute_pipeline_descriptors'] = [{'compute_function_descriptor': fd(lib, entry)} for lib, entry in computes]   # none: the script of bases alone, as before
+-    return {'libraries': list(libs.values()), 'function_descriptors': {'library_function_descriptors': list(fns.values())},
+-            'pipeline_descriptors': descriptors}
++    functions_ = {'library_function_descriptors': list(fns.values())}
++    if specs: functions_['specialized_function_descriptors'] = list(specs.values())   # none: the script as before, so other games' archive keys hold
++    return {'libraries': list(libs.values()), 'function_descriptors': functions_, 'pipeline_descriptors': descriptors}
+ 
+ 
+ def write_script(path, configuration):
+diff --git a/dm/tools/tests/test_pso_offline.py b/dm/tools/tests/test_pso_offline.py
+--- a/dm/tools/tests/test_pso_offline.py
++++ b/dm/tools/tests/test_pso_offline.py
+@@ -30,14 +30,16 @@
+ 
+ def metallib(funcs, layer=False):
+     """A .metallib header as the Metal compiler writes it: the function list (count, then per function its size counting the size field, NAME, ENDT) and the public metadata
+-    (per function its size not counting the size field, a CNST tag for a function with constants, ENDT); funcs: [(name, has constants)]"""
++    (per function its size not counting the size field, a CNST tag for a function with constants, ENDT); funcs: [(name, has constants)], or (name, (constant name, ...))"""
+     fl = struct.pack('<I', len(funcs))
+     for name, _ in funcs:
+         body = tag(b'NAME', name.encode() + b'\0') + tag(b'TYPE', b'\0') + b'ENDT'
+         fl += struct.pack('<I', 4 + len(body)) + body
+     pm = b''
+     for _, const in funcs:
+-        body = (tag(b'CNST', b'\x01\x00spvLinearTextureAlignmentOverride\x00\x35\xff\xff\x00') if const else b'') + b'ENDT'
++        names = const if isinstance(const, tuple) else ('spvLinearTextureAlignmentOverride',) if const else ()
++        cnst = struct.pack('<H', len(names)) + b''.join(n.encode() + b'\0\x35' + struct.pack('<H', 216 if n == 'dm_border_off' else 0xffff) + b'\0' for n in names)
++        body = (tag(b'CNST', cnst) if names else b'') + b'ENDT'
+         pm += struct.pack('<I', len(body)) + body
+     fo = 0x58; po_ = fo + len(fl)
+     head = b'MTLB' + b'\0' * 0x14 + struct.pack('<QQQQ', fo, len(fl), po_, len(pm))
+@@ -73,6 +75,13 @@
+             self.assertEqual(po.functions(p), {'main0': False, 'main0_z': False, 'fmain': True})
+             p.write_bytes(b'not a library'); self.assertRaises(ValueError, po.functions, p)
+             p.write_bytes(metallib([('main0', False)])[:0x60]); self.assertRaises(ValueError, po.functions, p)
++
++    def test_constant_names(self):   # the CNST tag as the Metal compiler writes it (Ocarina of Time's border-off libraries: count 1, "dm_border_off", bool 0x35, index 216, 0)
++        with tempfile.TemporaryDirectory() as t:
++            p = Path(t, 'x.metallib'); p.write_bytes(metallib([('main0', ('dm_border_off',)), ('main0_u', ('dm_border_off', 'spvLinearTextureAlignmentOverride')), ('vs', False)]))
++            self.assertEqual(po.constants(p), {'main0': ('dm_border_off',), 'main0_u': ('dm_border_off', 'spvLinearTextureAlignmentOverride'), 'vs': ()})
++            self.assertEqual(po.functions(p), {'main0': True, 'main0_u': True, 'vs': False})
++            self.assertEqual(po.HOST_CONSTANTS['dm_border_off'], (216, True))   # dmsh_abi.h DMSH_BORDER_FC, set as nvn_mtl.m pre_fn sets it
+ 
+     @unittest.skipUnless(shutil.which('xcrun'), 'needs the Metal compiler')
+     def test_a_real_library(self):
+@@ -118,6 +127,25 @@
+         bases, _, _ = po.plan(self.d, CHAIN, pairs[:2], True)   # near = 0: the entry_z entries
+         self.assertEqual(bases, [('pull_bp', 'main0_z', 'fs_b', 'main0'), ('plain_b', 'main0_z', 'fs_b', 'main0')])
+ 
++    def test_border_constant_is_specialized_as_the_host_does(self):   # pre_fn: dm_border_off true, every other constant at its default; a pair with another constant stays on the device
++        vz = [('main0', False), ('main0_z', False)]
++        self.shader('pull', {'entry_z': 'main0_z', 'pull': {'entry': 'main0'}, 'vertex_inputs': [{'location': 0}]}, {'_b': vz, '_bp': [('main0', ('dm_border_off',))]})
++        self.shader('fb', {}, {'_b': [('main0', ('dm_border_off',))]})
++        self.shader('fbs', {}, {'_b': [('main0', ('dm_border_off', 'spvLinearTextureAlignmentOverride'))]})
++        self.shader('fs', {}, {'_b': [('main0', False)]})
++        bases, rest, _ = po.plan(self.d, CHAIN, [('pull', 'fb'), ('pull', 'fbs'), ('pull', 'fs')], False)
++        self.assertEqual(bases, [('pull_bp', 'main0', 'fb_b', 'main0'), ('pull_bp', 'main0', 'fs_b', 'main0')])
++        self.assertEqual(rest, [('pull', 'fbs')])
++        j = po.script(self.d, bases)
++        spec = j['function_descriptors']['specialized_function_descriptors']
++        self.assertEqual([(s['label'], s['function_descriptor']) for s in spec], [('pull_bp.main0.host', 'fnd:pull_bp.main0'), ('fb_b.main0.host', 'fnd:fb_b.main0')])
++        self.assertEqual(spec[0]['constant_values'], [{'id_type': 'FunctionConstantIndex', 'id': {'data': 216}, 'value_type': 'ConstantBool', 'value': {'data': True}}])
++        p = j['pipeline_descriptors']['render_pipeline_descriptors']
++        self.assertEqual([(x['vertex_function_descriptor'], x['fragment_function_descriptor']) for x in p],
++                         [('fnd:pull_bp.main0.host', 'fnd:fb_b.main0.host'), ('fnd:pull_bp.main0.host', 'fnd:fs_b.main0')])
++        self.shader('plain', {}, {'_b': vz})
++        self.assertNotIn('specialized_function_descriptors', po.script(self.d, [('plain_b', 'main0', 'fs_b', 'main0')])['function_descriptors'])   # none: the script as before
++
+     def test_script(self):
+         j = po.script(self.d, [('v_bp', 'main0', 'f_b', 'main0'), ('w_bp', 'main0_z', 'f_b', 'main0')])
+         self.assertEqual([l['label'] for l in j['libraries']], ['v_bp', 'f_b', 'w_bp'])
+@@ -158,6 +186,15 @@
+         pipes, left = po.plan_compute(self.d, CHAIN, keys)
+         self.assertEqual(pipes, [('c1_b', 'main0'), ('c2_b', 'main0')])   # each once
+         self.assertEqual(left, {'reflection': 3, 'library': 1, 'entry': 1, 'constants': 1})
++
++    def test_border_constant_kernel_is_specialized(self):   # the border corrections' constant alone: specialized as cps_new looks up the common dispatch's pipeline (bd_off)
++        self.shader('kb', {'stage': 'cs'}, {'_b': [('main0', ('dm_border_off',))]})
++        self.shader('kbs', {'stage': 'cs'}, {'_b': [('main0', ('dm_border_off', 'spvLinearTextureAlignmentOverride'))]})
++        pipes, left = po.plan_compute(self.d, CHAIN, ['kb_b', 'kbs_b'])
++        self.assertEqual(pipes, [('kb_b', 'main0')]); self.assertEqual(left['constants'], 1)
++        j = po.script(self.d, [], pipes)
++        self.assertEqual(j['pipeline_descriptors']['compute_pipeline_descriptors'], [{'compute_function_descriptor': 'fnd:kb_b.main0.host'}])
++        self.assertEqual(j['function_descriptors']['specialized_function_descriptors'][0]['constant_values'][0]['id'], {'data': 216})
+ 
+     def test_pipelines_from_a_library_image(self):   # one-file libraries (b-<chain>.img, shader_lib.py), as dmsh_build.py writes them: read in place, as plan reads the bases
+         self.shader('c1', {'stage': 'cs'}, {'_b': [('main0', False)]})
+diff --git a/docs/agents/symptoms.md b/docs/agents/symptoms.md
+--- a/docs/agents/symptoms.md
++++ b/docs/agents/symptoms.md
+@@ -660,6 +660,7 @@
+ - streamed textures read 0 (magenta on Monster Hunter Rise's title screen's clothes). → [Sparse textures bound from their first mapped level](../reference/rendering.md#sparse-textures-bound-from-their-first-mapped-level)
+ - textures a mip level sharper or blurrier than on the Switch where the game biases its sampler; in the Vulkan layer, a red line `sampler LOD bias … not implemented`. → [Sampler LOD bias](../reference/rendering.md#sampler-lod-bias)
+ - whatever a game keeps in a texture that it samples past its edge with clamp-to-border reads the wrong value there: grass flattened along Link's path in Tears of the Kingdom, its bend map filled with "bent" wherever the window scrolled. → [Border colours Metal has no sampler state for](../reference/rendering.md#border-colours-metal-has-no-sampler-state-for)
++- material pipelines spill registers even when every sampler uses a native Metal border colour. → [Unused border corrections retain sample registers](../reference/rendering.md#unused-border-corrections-retain-sample-registers)
+ - the process ends at once (the window vanishes), with `-[MTLTextureDescriptorInternal validateWithDevice:]` failing an assertion such as `requests 9 mipmap levels, but the dimensions (1, 1, 1) can only support 1`, or `sampleCount must be > 1 for multisample textures`. → [Texture fields Metal refuses](../reference/rendering.md#texture-fields-metal-refuses)
+ - in an Unreal Engine game, textures and lighting turn blurry and muddy about a second after an area loads and stay that way, whatever the frame rate, render scale or upscaling; no red line. → [Unreal's texture streaming pool](../reference/rendering.md#unreals-texture-streaming-pool)
+ - ≈13 MB/frame leak. → [Transient render targets shared by storage](../reference/rendering.md#transient-render-targets-shared-by-storage)
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -130,6 +130,7 @@
+ DM_NVN_BC_ALIAS	diagnostic	Set 0 to send copies to an uncompressed alias instead of its block-compressed storage, for an A/B check; default 1
+ DM_NVN_BF_WANT	path	`=<file>`: appends the key of each fragment shader whose passes could not be merged for lack of a readable-tile version to that file, once per key
+ DM_NVN_BLIT_ORDER	diagnostic	`0` drops the barriers between dependent operations in the copy encoder, which reproduces the fountain's vertical stripes in Mario Wonder
++DM_NVN_BORDER_KEEP	diagnostic	1 keeps the border corrections in every pipeline, as before the DMSH_BORDER_FC specialization: a wrong border colour with the specialization, or its cost (ab with DM_AB)
+ DM_NVN_CAPTURE	diagnostic	`=<frame>:1:<path>` writes that frame (from its first submit to its present) to one file: pool bytes, registries, program keys, the textures whose content lives only in Metal, each submission's records with pointers relocatable, and the presented frame's SHA-256 and pixels; `dm/gfx/tests/nvn_replay` replays it ([development.md](development.md#frame-capture-and-replay))
+ DM_NVN_CBDUMP	diagnostic	`=<dir>`: saves each draw's whole uniform blocks as `F<frame>_p<pass>_st<stage>_cb<slot>_<address>.bin`, and the source bytes of buffer-to-3D-texture copies, with `DM_NVN_PASSDUMP`
+ DM_NVN_CBDUMP_KEY	diagnostic	`=<shader key>`: limits `DM_NVN_CBDUMP` to draws using that shader; for a vertex shader key also saves the draw's vertex streams and index buffer
+diff --git a/docs/reference/rendering.md b/docs/reference/rendering.md
+--- a/docs/reference/rendering.md
++++ b/docs/reference/rendering.md
+@@ -271,10 +271,18 @@
+ 
+ - **Symptom:** whatever a game keeps in a texture that it samples past its edge with clamp-to-border reads the wrong value there: grass flattened along Link's path in Tears of the Kingdom, its bend map filled with "bent" wherever the window scrolled.
+ - **Cause:** NVN's `SamplerBuilderSetBorderColor` takes any RGBA colour; `MTLSamplerBorderColor` has transparent black, opaque black and opaque white only, and `samp_by_id` took the nearest of them. Tears of the Kingdom's border (0.5, 0.5, 0.5, 0.5) became (0, 0, 0, 0).
+-- **Fix:** a filtered sample is linear in the border colour, so two samples through samplers that differ only in their Metal border colour give the exact one: r = s_n + (s_w − s_n)·k, k = (B − Bn) / (Bw − Bn) per channel. The build (`dmsh_build.py border_emu`) wraps every sample through a sampler member of the argument buffer in `dm_bs(…)`, adds a twin sampler member `<member>_w` for each, and one block `dm_border` (a mask word, then k per sampler; `DMSH_BORDER_*` in `dmsh_abi.h`). The host (`nvn_border.h`) keeps the nearest Metal colour for the sampler and makes a twin only for a colour Metal lacks when a wrap mode reaches the border and no min / max reduction is set; `encode_args` binds the twin and sets the sampler's bit and k, and binds the shared zero bank as the block otherwise. Every other sample costs one uniform branch on the mask; the twin sample runs only for those samplers. The readable-tile variants (`dmsh_fetch.py`) replace a wrapped sample whole, so a tile read is never corrected.
++- **Fix:** a filtered sample is linear in the border colour, so two samples through samplers that differ only in their Metal border colour give the exact one: r = s_n + (s_w − s_n)·k, k = (B − Bn) / (Bw − Bn) per channel. The build (`dmsh_build.py border_emu`) wraps every sample through a sampler member of the argument buffer in `dm_bs(…)`, adds a twin sampler member `<member>_w` for each, and one block `dm_border` (a mask word, then k per sampler; `DMSH_BORDER_*` in `dmsh_abi.h`). The host (`nvn_border.h`) keeps the nearest Metal colour for the sampler and makes a twin only for a colour Metal lacks when a wrap mode reaches the border and no min / max reduction is set; `encode_args` binds the twin and sets the sampler's bit and k, and binds the shared zero bank as the block otherwise. The twin sample runs only for those samplers. Kernels retain the uniform mask branch; render pipelines can specialize unused corrections away ([details](#unused-border-corrections-retain-sample-registers)). The readable-tile variants (`dmsh_fetch.py`) replace a wrapped sample whole, so a tile read is never corrected.
+ - **Not covered:** samples through sampler arrays, `sample_compare` and `gather`, and samples of integer textures (not filtered; their border colour is an integer one) keep the nearest Metal colour; so does the Vulkan layer, which has its own translation.
+ - **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md): the grass bend map, a 256×256 RG8 window that follows Link, advanced by `ff9def5b3c418851` with wrap 5 and border 0.5.
+ - **Check:** `t_border` (nvn_border's choices for opaque, translucent and Metal's own colours, and the registry's twins) and `test_dmsh_border.py` (the rewrite, the reflection, the readable-tile variant, the compile for macOS and iOS, and with `make check_t_border` the GPU: corrected samples against Maxwell's bilinear filter with the border colour, and Metal's nearest colour with the mask clear).
++
++### Unused border corrections retain sample registers
++
++- **Symptom:** material pipelines spill registers even when every sampler uses a native Metal border colour.
++- **Cause:** the uniform mask branch in `dm_bs` keeps the twin sample's operands live even when no draw needs the correction.
++- **Fix:** every shader that corrects a sample exposes `dm_border_off` (`DMSH_BORDER_FC`, 216). An undefined constant preserves the corrections. `border_need` checks registered sampler parameters before lazy Metal sampler creation; `pso_key.border` distinguishes draws that need corrections. Vertex, fragment, task and mesh stages, including the vertex-pulling replacement, and compute dispatches (`cs_fn`) specialize the constant to true only when none of their corrected samples needs a twin. `bd_off` copies previous function constants and caches by the descriptor the function was noted with (`fn4_of`). Metal hands out one `MTLFunction` per function content, device-wide (`newFunctionWithName:` on the same library, or on another library loaded from the same data, returns the same object on macOS 27.2), while the host keys a specialization by its function object (`fn4_note`, `fn_dev`, `pbase_key`): on the Metal 4 path the border-off specialization is therefore a proxy (`FnVariant`) with its own descriptor and `fn_dev` record, which forwards every other message to the base function; noting the new constants on the shared object would have taken the corrections from every draw of that shader. Mesh pipelines materialize the specialization through `fn_dev`, with generated geometry entries recording their descriptors through `geo_mesh_entry`. Pair prebuilds use the same border-off specialization (`pre_fn`), and so does the offline pipeline archive (`pso_offline.py` `HOST_CONSTANTS`: metal-tt specializes a `<key>_b` or `<key>_bp` function, and the host finds the base by its specialized descriptor), so the pairs stay in the app's archive. Older serialized rows read as border-off and live draws needing corrections have a different key. `DM_NVN_BORDER_KEEP=1` keeps the corrections in every pipeline (diagnostic; `ab` alternates it with `DM_AB`). A compute shader with constants is loaded like the other stages (`fn_spec`): `cps_new` looks its pipeline up by the specialized descriptor, in the bundle and the device's archives, builds it through the MTLDevice from `fn_dev`'s specialization on a miss and captures it; compute pipelines are keyed by shader and variant (`cps_key`), and the prewarm builds the border-off one. Geometry kernels keep the corrections (`fn_dev`). Sampler arrays, gathers and comparisons retain the existing limitations described above.
++- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#unused-border-corrections): its 1080p material passes spilled 300-400 bytes a thread; in-process A/B on a MacBook Air M4, 1.8 ms of a 26.5 ms frame (1.5 ms in the render stages, the rest in its kernels, NDSR's network among them).
++- **Check:** `t_pso_skey` covers old row lengths; `t_border --cpu` covers first use before sampler creation, per-stage bindings and sampler re-registration. The GPU cases in `t_border` check preservation of existing constants, the original function and prewarm specialization, each on a kernel of its own content, alongside the existing filtered-border samples. The rewritten kernel of `test_dmsh_border.py` runs on the GPU through `cps_new`, with the corrections and without them (`cs_fn`). `test_pso_offline.py` checks the constant names and the specialized bases and compute pipelines.
+ 
+ ### Texture fields Metal refuses
+ 

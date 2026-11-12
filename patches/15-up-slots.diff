@@ -1,0 +1,87 @@
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -104,7 +104,11 @@
+ // Ocarina submits about 20 small batches a frame in Hyrule Field: with 8 allocators the submit thread blocked on the oldest about 17 times a frame while the GPU sat idle for half of it. DM_NVN_ALLOC_CAP lowers the cap (and the visibility ring's, which is one per submission) to compare.
+ static int alloc_cap(void) { static int v; if (!v) { const char *e = getenv("DM_NVN_ALLOC_CAP"); int n = e ? atoi(e) : ALLOC_MAX; v = n < 3 ? 3 : n > ALLOC_MAX ? ALLOC_MAX : n; } return v; }
+ static id<MTL4CommandAllocator> g_alloc4[ALLOC_MAX]; static int g_alloc_n, g_alloc_cur;   // Command allocator pool of the main submission: at start pick one the GPU has finished with, create a new one if there is none (wait only at the cap)
+-static id<MTL4CommandAllocator> g_up_alloc4[3];
++#define UP_SLOTS 8
++// Ocarina of Time makes 1.3 to 1.9 upload batches a frame, more while textures stream in: with 3 slots taken in turn the submit thread waited in up_begin for a batch queued behind the frame's GPU work
++// (M1 Max, walking in Kokiri Forest: the submit step blocked 20 to 50 ms in frames with uploads). DM_NVN_UP_SLOTS lowers the count to compare (3 is the old value)
++static int up_slots(void) { static int v; if (!v) { const char *e = getenv("DM_NVN_UP_SLOTS"); int n = e ? atoi(e) : UP_SLOTS; v = n < 3 ? 3 : n > UP_SLOTS ? UP_SLOTS : n; } return v; }
++static id<MTL4CommandAllocator> g_up_alloc4[UP_SLOTS];   // the first 3 are made at start, the others the first time their slot comes round (up_begin)
+ static id<MTL4CommandAllocator> g_present_alloc4[3];
+ static id<MTL4CommandBuffer> g_present_cb[3];
+ static id<MTL4ArgumentTable> g_vt, g_ft, g_ct, g_up_ct, g_ot;   // g_ot: the object stage of a task / mesh draw (mesh_tasks_draw)
+@@ -3002,7 +3006,7 @@
+ static _Atomic uint64_t g_upload_gpu_ns;
+ static id<MTL4CommandBuffer> g_up_cb;
+ static id<MTL4ComputeCommandEncoder> g_up_ce;
+-static _Atomic int g_up_alloc_busy[3];
++static _Atomic int g_up_alloc_busy[UP_SLOTS];
+ // Waiting for upload batches to finish (g_up_pending, g_up_alloc_busy): the batches' completion handler broadcasts after it updates them, so waiters sleep until then (they used to poll every 0.2–1 ms;
+ // Three Houses' loader calls QueueFinish after each resource, each one waited up to a millisecond late). The 10 ms timeout is only a safety net
+ static pthread_mutex_t g_up_wmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_up_wcv = PTHREAD_COND_INITIALIZER;
+@@ -3018,11 +3022,11 @@
+ static unsigned g_up_seq;
+ #define UP_BLOCK_SIZE (32u * 1024u * 1024u)
+ // Each upload slot keeps its staging resident until its next batch (up_begin waits for the previous batch). Grow the first block to the slot's previous batch demand, not just its first texture:
+-// a small first texture followed by a large one otherwise allocates and retires a fresh 32 MB overflow every frame. Keep one overflow as well, at most 64 MB per slot / 192 MB across all three.
++// a small first texture followed by a large one otherwise allocates and retires a fresh 32 MB overflow every frame. Keep one overflow as well, at most 64 MB per slot (512 MB across the 8 slots).
+ // Bursts beyond that budget and individual uploads larger than UP_BLOCK_SIZE still use temporary blocks, retired only after their GPU work. DM_NVN_UPLOAD_REUSE=0 keeps the original one-block policy.
+ #define UP_SLOT_BLOCK (4u * 1024u * 1024u)
+-static __strong id<MTLBuffer> g_up_slot_blk[3], g_up_slot_over[3]; static unsigned g_up_cur_slot;
+-static size_t g_up_slot_want[3], g_up_batch_bytes; static int g_up_over_used;
++static __strong id<MTLBuffer> g_up_slot_blk[UP_SLOTS], g_up_slot_over[UP_SLOTS]; static unsigned g_up_cur_slot;
++static size_t g_up_slot_want[UP_SLOTS], g_up_batch_bytes; static int g_up_over_used;
+ static int up_reuse(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_UPLOAD_REUSE"); on = !e || atoi(e); } return on; }
+ static int up_retained(id<MTLBuffer> b, unsigned slot) { return b && (b == g_up_slot_blk[slot] || b == g_up_slot_over[slot]); }
+ typedef struct {
+@@ -3038,7 +3042,7 @@
+ static id<MTLBuffer> g_up_block;
+ static size_t g_up_block_off, g_up_block_size;
+ static NSMutableArray *g_up_keep;
+-// Limit overflow staging per batch. The three upload slots bound in-flight
++// Limit overflow staging per batch. The upload slots (up_slots) bound in-flight
+ // batches; up_begin publishes queued commits before waiting for a slot. A single
+ // texture larger than the budget gets its own block (uploads are not tiled here).
+ static size_t g_up_staging_bytes;
+@@ -3067,7 +3071,7 @@
+     }
+     if (b) { m4_end(b); g_up_ce = nil; }
+     id<MTL4CommandBuffer> cb = g_up_cb;
+-    unsigned slot = (g_up_seq - 1) % 3;
++    unsigned slot = (g_up_seq - 1) % (unsigned)up_slots();
+     // Only this upload batch uses its overflow staging. Retire it on upload
+     // completion, even when the main rendering submission is still being built.
+     NSMutableArray *staging = g_up_keep;
+@@ -3115,7 +3119,7 @@
+ static void up_begin(void) {
+     up_owner_check("up_begin");
+     if (g_up_cb) return;
+-    unsigned slot = g_up_seq++ % 3;
++    unsigned slot = g_up_seq++ % (unsigned)up_slots();
+     // The slot's last batch may still be only a commit record in the encode thread's current block (rec_commit_upload), which is handed over when it fills or the submission drains:
+     // waiting without handing it over waited for a batch never committed. Little Nightmares II's first render passes zero-filled enough new targets to come round to a slot within one
+     // block, and its RHI thread waited for good inside nvnQueueSubmitCommands (q_cb drains before it waits for the same reason)
+@@ -3123,6 +3127,8 @@
+     up_wait_zero(&g_up_alloc_busy[slot], WS_UPALLOC);
+     atomic_store(&g_up_alloc_busy[slot], 1); g_up_cur_slot = slot;
+     g_up_batch_bytes = 0; g_up_over_used = 0;
++    if (!g_up_alloc4[slot]) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
++        g_up_alloc4[slot] = [g_dev newCommandAllocatorWithDescriptor:ad error:&ae]; if (!g_up_alloc4[slot]) MDIE("failed to create upload MTL4CommandAllocator[%u]: %s", slot, ae.localizedDescription.UTF8String); }
+     [g_up_alloc4[slot] reset];
+     g_up_cb = [g_dev newCommandBuffer];
+     [g_up_cb beginCommandBufferWithAllocator:g_up_alloc4[slot]];
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -226,6 +226,7 @@
+ DM_NVN_UDC_AB	diagnostic	`=1` starts with the DontCare store for unwritten attachments off and turns it on after the second screenshot, for an on/off picture comparison in one run
+ DM_NVN_UNWRITTEN_DC	switch	`0` disables optional stores elided for loaded, unchanged attachments (on by default, independent of TBDR lookahead), for equivalence comparisons; mandatory image-write preservation stays active
+ DM_NVN_UPLOAD_REUSE	switch	0 keeps the original one-block upload-slot policy; default retains bounded demand-sized primary and overflow buffers after completion.
++DM_NVN_UP_SLOTS	switch	Upload slots taken in turn by upload batches, from 3 to 8 (default 8); `=3` is the old count, where a burst of uploads made the submit thread wait for a batch queued behind the frame's GPU work
+ DM_NVN_VBUF_CACHE	switch	`0` turns off the cache of resolved vertex stream addresses and vertex argument table writes across draws (on by default), for A/B runs
+ DM_NVN_VCONV_CHECK	diagnostic	`=1` scans the indices again at every reuse of a cached vertex conversion range (`vconv_range`) and reports differences
+ DM_NVN_VCONV_CPU	switch	`=1` converts integer vertex inputs fed formats of another class on the CPU, as before, instead of through the shader's shadow inputs (`<key>_bv`)

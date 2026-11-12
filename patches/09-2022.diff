@@ -1,0 +1,163 @@
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -6280,7 +6280,16 @@
+     int same = t && rr->ok && rr->has_v == (v != NULL) && !memcmp(&rr->t, t, sizeof *t) && (!v || !memcmp(&rr->v, v, sizeof *v));
+     if (rr->gone) { rr->gone = 0; reg_bump(id_, 0); }   // registered again (pool storage made anew), even with the same data
+     if (!same) {
+-        reg_bump(id_, 0); pool_seen_clear(id_);
++        // An ID whose texture a shader has read (pool_seen) keeps that mark when the game puts another texture into it: the shaders go on reading the ID, so the next walk makes the new texture
++        // under the read budget (POOL_REQ_BYTES). Without the mark a walk makes it only within the walk's room (pool_room), which is 0 once pool_budget() is spent: Ocarina of Time allocates
++        // 15-18 GB against a 909 MB budget on a 24 GB Mac, so there an unread ID holds the dummy until a shader reads it. The game replaces the 17 textures of a material set at once (3-7 MB each)
++        // when the player nears the castle town wall, and registers each step twice, 4-5 frames apart: with the mark cleared, each registration's first read found the dummy, and the wall, the
++        // rocks and the trees drew black for one frame, twice. Only an ID that held a made texture keeps the mark (retired: a streaming replacement finalizes the old texture first, which drops
++        // its view); one that held none, or is emptied, is cleared as before. A texture streamed into an ID no shader has read yet still reads the dummy once (issue #1969).
++        // DM_NVN_POOL_SEEN_KEEP=0: clear it on every change, as before
++        static int keep = -1; if (keep < 0) { const char *e = getenv("DM_NVN_POOL_SEEN_KEEP"); keep = !(e && !strcmp(e, "0")); }
++        int keep_it = keep && t && rr->ok && (rr->retired || rr->view);
++        reg_bump(id_, 0); if (!keep_it) pool_seen_clear(id_);
+         treg_unlink(id_); treg_drop_views(rr);
+         rr->tt1 = 0;
+         rr->ok = t != NULL; if (t) rr->t = *t; rr->has_v = v != NULL; if (v) rr->v = *v;
+diff --git a/dm/gfx/tests/Makefile b/dm/gfx/tests/Makefile
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -584,3 +584,12 @@
+ t_ixc_ranges: t_ixc_ranges.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ $< $(MTL_T_SRC) $(FW)
+ check_t_ixc_ranges: RUN_ENV = MTL_DEBUG_LAYER=1
++
++# Replacement history: first-table GPU pixels and finalized IDs.
++t_pool_seen_replace: t_pool_seen_replace.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_seen_replace.m $(MTL_T_SRC) $(FW)
++.PHONY: check_t_pool_seen_replace
++check_t_pool_seen_replace: t_pool_seen_replace
++	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_pool_seen_replace
++	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./t_pool_seen_replace
++	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 DM_NVN_POOL_SEEN_KEEP=0 ./t_pool_seen_replace
+diff --git a/dm/gfx/tests/t_pool_chunks.m b/dm/gfx/tests/t_pool_chunks.m
+--- a/dm/gfx/tests/t_pool_chunks.m
++++ b/dm/gfx/tests/t_pool_chunks.m
+@@ -131,8 +131,16 @@
+         CHECK("an unread one stays the dummy", e2[302] == dummy);
+         CHECK("a read render target no pass wrote stays the dummy", e2[303] == dummy);
+         os_unfair_lock_unlock(&g_rmu); finish();
+-        mtl_reg_tex(301, &un, NULL); CHECK("an ID given another texture has not been read", !pool_seen(301));
+-        mtl_reg_tex(301, NULL, NULL); mtl_reg_tex(302, NULL, NULL); mtl_reg_tex(303, NULL, NULL); mtl_tex_release(&rd); mtl_tex_release(&un); mtl_drain(); hog = nil;
++        // Another texture in a read ID: an ID that held a made texture keeps its mark, so the next walk makes the replacement (DM_NVN_POOL_SEEN_KEEP=0: cleared, as before); an emptied ID
++        // is cleared, and an ID given its first texture has not been read
++        const char *ke = getenv("DM_NVN_POOL_SEEN_KEEP"); int keep = !(ke && !strcmp(ke, "0"));
++        tex_t t4 = rd; t4.serial = 99804; t4.mem = mem + 130 * MB; t4.off = 130 * MB;
++        mtl_reg_tex(301, &un, NULL);
++        if (keep) CHECK("an ID whose made texture is replaced keeps its read mark", pool_seen(301));
++        else CHECK("DM_NVN_POOL_SEEN_KEEP=0: an ID given another texture has not been read", !pool_seen(301));
++        mtl_reg_tex(301, NULL, NULL); CHECK("an emptied ID has not been read", !pool_seen(301));
++        mtl_reg_tex(304, &t4, NULL); CHECK("an ID given its first texture has not been read", !pool_seen(304));
++        mtl_reg_tex(302, NULL, NULL); mtl_reg_tex(303, NULL, NULL); mtl_reg_tex(304, NULL, NULL); mtl_tex_release(&rd); mtl_tex_release(&un); mtl_drain(); hog = nil;
+     }
+     // The write log: one bit an entry, and the host learns the range of the entry the bit names, from the table the shader used
+     {
+diff --git a/dm/gfx/tests/t_pool_seen_replace.m b/dm/gfx/tests/t_pool_seen_replace.m
+new file mode 100644
+--- /dev/null
++++ b/dm/gfx/tests/t_pool_seen_replace.m
+@@ -0,0 +1,88 @@
++// A historically read texture ID keeps its mark across streaming replacements.
++// Zero ordinary walk room exercises first-table materialization and GPU pixels.
++// Finalize-before-replace, unread IDs and unwritten render targets stay distinct.
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(c, msg) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (%d)\n", msg, __LINE__); } } while (0)
++static uint64_t entry(id<MTLBuffer> b, int i) { return ((uint64_t *)((uint8_t *)b.contents + DMSH_POOL_HEAD))[i]; }
++static uint64_t dummy(id<MTLBuffer> b) { return entry(b, *(uint32_t *)b.contents); }
++static id<MTLBuffer> table(void) {
++    mtl_sub_begin();
++    // Exhaust the ordinary per-frame allowance, without allocating a working-set-sized buffer.
++    g_walk_frame = atomic_load(&g_cur_frame); g_walk_spent = POOL_FRAME_BYTES; g_walk_req = 0;
++    __unsafe_unretained id<MTLBuffer> b = nil;
++    os_unfair_lock_lock(&g_rmu);
++    CHECK(pool_room() == 0, "ordinary walk has zero room");
++    pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &b);
++    os_unfair_lock_unlock(&g_rmu);
++    id<MTLBuffer> held = b;
++    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "submission completed");
++    CHECK(!mtl_last_commit_error(), "submission has no GPU error");
++    return held;
++}
++static void read_mark(int i) { pool_seen_gpu(); atomic_fetch_or((_Atomic uint32_t *)g_seen_buf.contents + i / 32, 1u << (i % 32)); }
++static int pixel_is(int i, uint8_t v) {
++    id<MTLTexture> t = (__bridge id<MTLTexture>)g_treg[i].view;
++    if (!t) return 0; // Do not resolve here: that would hide a failed pool walk.
++    id<MTLBuffer> b = [g_dev newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
++    if (!b) return 0;
++    id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
++    [bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(64,64,1)
++              toBuffer:b destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:16384];
++    [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
++    if (cb.status != MTLCommandBufferStatusCompleted) return 0;
++    for (size_t n = 0; n < 16384; n++) if (((uint8_t *)b.contents)[n] != v) return 0;
++    return 1;
++}
++int main(void) { @autoreleasepool {
++    mtl_init();
++    const char *e = getenv("DM_NVN_POOL_SEEN_KEEP"); int keep = !(e && !strcmp(e, "0"));
++    enum { LEN = 1 << 20, N = 6 };
++    uint8_t *mem = mmap(NULL, LEN, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (mem == MAP_FAILED) abort();
++    pool_t p = {.magic=MAGIC('P','O','O','L'), .mem=mem, .size=LEN, .flags=NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
++    mtl_pool_add(mem, LEN);
++    tex_t t[N] = {0};
++    for (int n=0; n<N; n++) {
++        t[n].magic=MAGIC('T','E','X',0); t[n].has_layout=1; t[n].serial=990100+n; t[n].pool=&p; t[n].off=n*65536; t[n].mem=mem+t[n].off;
++        t[n].d=(nvn_texdesc){.target=NVN_TEXTURE_TARGET_2D,.format=NVN_FORMAT_RGBA8,.width=64,.height=64,.depth=1,.levels=1,.samples=1};
++        if (n==5) { t[n].has_layout=0; t[n].d.flags=NVN_TEXTURE_FLAGS_COMPRESSIBLE; }
++        nvn_tex_layout(&t[n].d,&t[n].L); memset(t[n].mem,0x11*(n+1),t[n].L.size); mtl_tex_init(&t[n]);
++    }
++    mtl_reg_tex(10,&t[0],NULL); mtl_reg_tex(20,&t[3],NULL); read_mark(10);
++    id<MTLBuffer> old=table(); uint64_t original=entry(old,10);
++    CHECK(original!=dummy(old) && pixel_is(10,0x11),"historically read texture has original pixels");
++    CHECK(entry(old,20)==dummy(old),"never-read ID remains dummy at zero room");
++    mtl_reg_tex(10,&t[1],NULL);
++    id<MTLBuffer> direct=table();
++    CHECK(pool_seen(10)==keep,"live replacement retains history only with fix enabled");
++    CHECK((entry(direct,10)!=dummy(direct))==keep,"live replacement materialized in its first table");
++    if (keep) CHECK(pixel_is(10,0x22),"live replacement table names new pixels");
++    CHECK(entry(old,10)==original,"previous table retains its original entry");
++    // Establish a made, read ID in either mode before the finalize/re-register case.
++    read_mark(10); (void)table();
++    mtl_tex_release(&t[1]);
++    CHECK(g_treg[10].retired && !g_treg[10].view,"Finalize drops cached view while descriptor stays retired");
++    mtl_reg_tex(10,&t[2],NULL);
++    id<MTLBuffer> retired=table();
++    CHECK(pool_seen(10)==keep,"finalize-then-replace retains history only with fix enabled");
++    CHECK((entry(retired,10)!=dummy(retired))==keep,"retired replacement materialized in first table");
++    if (keep) CHECK(pixel_is(10,0x33),"retired replacement has replacement pixels");
++    mtl_reg_tex(20,&t[4],NULL); id<MTLBuffer> unread=table();
++    CHECK(!pool_seen(20) && entry(unread,20)==dummy(unread),"replacing unread ID does not invent a read mark");
++    read_mark(10); (void)table(); mtl_reg_tex(10,&t[5],NULL); id<MTLBuffer> target=table();
++    CHECK(entry(target,10)==dummy(target),"unwritten render target remains dummy despite old read history");
++    mtl_reg_tex(10,NULL,NULL); CHECK(!pool_seen(10),"emptying an ID clears its history");
++    mtl_reg_tex(10,&t[0],NULL); id<MTLBuffer> reset=table();
++    CHECK(!pool_seen(10),"empty then re-register does not resurrect history");
++    (void)reset;
++    mtl_reg_tex(10,NULL,NULL); mtl_reg_tex(20,NULL,NULL);
++    for(int n=0;n<N;n++) if(n!=1) mtl_tex_release(&t[n]);
++    mtl_pool_del(mem); mtl_drain(); munmap(mem,LEN);
++    fprintf(stderr,"pool_seen_replace: %d checks, %d failed\n",checks,failed);
++    return failed ? 1 : 0;
++} }
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -178,6 +178,7 @@
+ DM_NVN_PASSGPU	diagnostic	`=<file>` writes the GPU time of each render and compute pass from stage-boundary timestamp counters (off under Metal 4); also gives each dispatch its own encoder
+ DM_NVN_PASSGPU_SERIAL	diagnostic	`=1` makes each encoder on the main command buffer wait until all earlier work has finished, so `DM_NVN_PASSGPU` times read each pass's exclusive time (totals read high)
+ DM_NVN_POOL_CHUNKS	switch	`0` wraps a memory pool of 512 MB or more whole in one buffer, as before; by default it is wrapped in overlapping 16 MB chunks made as draws reach them, so only the parts in use are wired
++DM_NVN_POOL_SEEN_KEEP	switch	`0` clears a texture ID's "a shader read it" mark (pool_seen) whenever the game registers another texture into the ID, as before; by default an ID that held a made texture keeps the mark, so the next walk makes the replacement under the read budget instead of leaving it to read the dummy (black) at its first read (Ocarina of Time's castle town wall, rocks and trees black for one frame, twice, 4-5 frames apart, at streaming steps)
+ DM_NVN_PREDICT	switch	`0` turns off the parallel precompile look-ahead: a pipeline miss compiles only the pipeline it needs
+ DM_NVN_PREFETCH	switch	`0` turns off loading a program's shader libraries in the background when the game makes it (`nvnProgramSetShaders`); they load at its first draw instead
+ DM_NVN_PROF	diagnostic	`=1` wraps the implemented NVN functions in a timing wrapper and collects the time each takes during recording

@@ -1,0 +1,43 @@
+--- a/dm/games/settings.tsv
++++ b/dm/games/settings.tsv
+@@ -19,10 +19,10 @@
+ DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		level=basic
+ DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic
+ DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.	level=basic
+-DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX	game	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler
++DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX	metalfx	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler
+ DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
+ DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
+-DM_OUTPUT_HEIGHT	choice	0=Screen's own,1440=2560 × 1440,1080=1920 × 1080	0	platform:mac	Game	Fullscreen resolution	The picture is drawn at this size and the screen scales it up: less GPU time, a softer picture.	level=basic
++DM_OUTPUT_HEIGHT	choice	0=Screen's own,1440=2560 × 1440,1080=1920 × 1080	1440	platform:mac	Game	Fullscreen resolution	The picture is drawn at this size and the screen scales it up: less GPU time, a softer picture.	level=basic
+ DM_MFX_INTERP	choice	0=Off,interp30=30 + 30,interpmax=Uncapped	0	platform:mac	Game	Frame generation	MetalFX makes one frame between two game frames. 30 + 30 holds the game at 30 frames a second; Uncapped keeps the frame rate setting. Experimental.	level=basic
+ DM_PICTURE_FIT	choice	fit=Fit,fill=Fill	fit	platform:ios	Game	Picture	Fill crops the game's 16:9 picture to cover the screen. Health bars, subtitles or maps near the edges can be cut off. A full-screen picture without cropping needs a patch for each game.
+ DM_SHOW_FPS	toggle	-	build:DM_SHOW_FPS	platform:ios	Game	Frame-rate counter
+@@ -38,6 +38,6 @@
+ DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.	needs=DM_PSO_MTL4=1
+ DM_NVN_ENC_THREAD	toggle	-	1|DM_GAME_ENC_THREAD	gfxapi:nvn	Performance	Encode thread
+ DM_NVN_SYNC_LAG	choice	0=Off,1=1 frame,2=2 frames	0	gfxapi:nvn	Performance	GPU overlap	Lets the game build its next frame while the GPU still draws the last one. Experimental: can show wrong pictures.	level=basic
+-DM_NVN_PREENCODE	choice	0=Off,1=On	0	gfxapi:nvn	Performance	Encode ahead	Translates the next frame while the GPU still draws the last one, and sends it when the game is ready for it. Needs Encode thread on. Experimental.	level=basic
++DM_NVN_PREENCODE	choice	0=Off,1=On	1	gfxapi:nvn	Performance	Encode ahead	Translates the next frame while the GPU still draws the last one, and sends it when the game is ready for it. Needs Encode thread on. Experimental.	level=basic
+ DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
+ DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -637,7 +637,7 @@
+     if (g_dev) return;
+     const char *vbc = getenv("DM_NVN_VBUF_CACHE"); g_vbuf_cache = !(vbc && !strcmp(vbc, "0"));
+     const char *link = getenv("DM_PRESENT_LINK");
+-    g_dm_present_link = link ? atoi(link) : 1; if (g_dm_present_link < 0 || g_dm_present_link > 2) g_dm_present_link = 1; g_present_link_env = link != NULL;   // Default 1 (real-device same-process alternation: when load exceeds one display-link period, long frames 15% → 0 and frame intervals even out; no difference from 0 at a steady 60); DM_PRESENT_LINK=0 turns it off   // 1 = present on every tick of a 60 Hz display link; 2 = 120 Hz display link, the game presents a frame every other display-link tick (when behind, it can present on the next 8.33 ms display-link tick)
++    g_dm_present_link = link ? atoi(link) : 2; if (g_dm_present_link < 0 || g_dm_present_link > 2) g_dm_present_link = 1; g_present_link_env = link != NULL;   // Default 1 (real-device same-process alternation: when load exceeds one display-link period, long frames 15% → 0 and frame intervals even out; no difference from 0 at a steady 60); DM_PRESENT_LINK=0 turns it off   // 1 = present on every tick of a 60 Hz display link; 2 = 120 Hz display link, the game presents a frame every other display-link tick (when behind, it can present on the next 8.33 ms display-link tick)
+     const char *latency = getenv("DM_PRESENT_LATENCY");
+     if (latency && atoi(latency) > 0) g_present_latency = atoi(latency);
+     g_res_check_on = getenv("DM_RES_CHECK") != NULL;
+@@ -1548,7 +1548,7 @@
+ static int g_acs_live, g_acs_closed, g_acs_block;
+ static void *g_acs_wenc; static int g_acs_wall;   // the open encoder on g_cb whose begin waited for the dispatch stage (wall: for every stage of earlier work)
+ static uint64_t g_acs_windows, g_acs_nowait, g_acs_draw_hits, g_acs_rt_hits;   // windows opened, passes begun without the dispatch wait, draws and attachments that closed a window
+-static int acs_on(void) { static int m = -1, once; if (m < 0) m = sw_mode("DM_NVN_ASYNC_CS", 0); int on = m && sw_on(m) && !seam_on(); if (on && !once++) MLOG("DM_NVN_ASYNC_CS: groups of the game's compute dispatches run beside the draw passes after them (a pass or draw that may touch what they read or write waits for them)"); return on; }
++static int acs_on(void) { static int m = -1, once; if (m < 0) m = sw_mode("DM_NVN_ASYNC_CS", 1); int on = m && sw_on(m) && !seam_on(); if (on && !once++) MLOG("DM_NVN_ASYNC_CS: groups of the game's compute dispatches run beside the draw passes after them (a pass or draw that may touch what they read or write waits for them)"); return on; }
+ static int acs_rt_hit(void);   // the attachments of the pass being opened against the window (enc_r_begin_pass)
+ static void acs_close(void) { g_acs_closed |= g_acs_live; }
+ static void acs_block(void) { acs_close(); g_acs_block = 1; }

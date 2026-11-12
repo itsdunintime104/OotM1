@@ -1,0 +1,120 @@
+diff --git a/dm/gfx/nvn/nvn_geometry.inc b/dm/gfx/nvn/nvn_geometry.inc
+index 5a487ad6fc..261860ff14 100644
+--- a/dm/gfx/nvn/nvn_geometry.inc
++++ b/dm/gfx/nvn/nvn_geometry.inc
+@@ -693,7 +693,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
+     draw_(&triangle, NULL);
+     g_geo_program = nil; g_mtk.on = 0; args_dirty_all();
+     if (g_mtk.miss) { g_mtk_wait++; return; }
+-    swrite_note(pr); g_wr_epoch++;
++    uint64_t prior_epoch = g_wr_epoch; swrite_note(pr); g_wr_epoch++; ixc_mesh_written(pr, prior_epoch);
+     if (!g_mtk_n++) MLOG("task / mesh: first draw, task %s mesh %s fragment %s, %u workgroups from %u%s", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", g_mtk.count, g_mtk.first, ind ? " (indirect)" : "");
+ }
+ static uint64_t g_geo_mesh_n, g_geo_mesh_wait;   // mesh draws; draws the compute path drew while their mesh pipeline was built
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 3966c65760..51ed049974 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -12387,6 +12387,43 @@ static void ixc_run(const p_draw *dw, const p_draw_idx *di) {
+         int prim = e->prim, it = e->itype; unsigned long long fr = (unsigned long long)atomic_load(&g_cur_frame), pass = g_stat_pass, splits = g_ixc_splits; id<MTLBuffer> keep = ab;
+         [g_commit_blocks addObject:^{ (void)keep; MLOG("indirect draw conversion frame %llu pass %llu: primitive %d index type %d record %u,%u,%u,%u → arguments %u,%u,%u,%d,%u (splits so far %llu)", fr, pass, prim, it, src[0], src[1], src[2], src[3], arg[0], arg[1], arg[2], (int)arg[3], arg[4], splits); }]; }
+ }
++// A native mesh draw's bounded storage writes need not invalidate conversions
++// of unrelated indirect records. Keep the global write epoch for every other
++// consumer; advance this cache alone only after proving all its inputs disjoint.
++// Unknown writes, sparse aliases and overlapping inputs retain full invalidation.
++static int ixc_range_disjoint(uint64_t lo, uint64_t n) {
++    if (!n || lo > UINT64_MAX - n || nvn_sparse_alias(lo, lo + n)) return 0;
++    for (int i = 0; i < g_ixc_n; i++) {
++        const ixc_ent *e = &g_ixc[i];
++        uint64_t nr = e->itype < 0 ? 16 : 20;
++        if (e->ind > UINT64_MAX - nr || nvn_sparse_alias(e->ind, e->ind + nr) || (lo < e->ind + nr && e->ind < lo + n)) return 0;
++        if (e->ibuf) {
++            // firstIndex is GPU-written: output capacity does not bound the
++            // input offset. Conservatively protect the whole remaining buffer.
++            void *mb; uint64_t mo;
++            if (!mtl_addr(e->ibuf, 1, &mb, &mo)) return 0;
++            uint64_t len = ((__bridge id<MTLBuffer>)mb).length;
++            if (mo >= len || e->ibuf > UINT64_MAX - (len - mo)) return 0;
++            uint64_t end = e->ibuf + len - mo;
++            if (nvn_sparse_alias(e->ibuf, end) || (lo < end && e->ibuf < lo + n)) return 0;
++        }
++    }
++    return 1;
++}
++static void ixc_mesh_written(NvProg *pr, uint64_t prior_epoch) {
++    if (!pr || !g_ixc_n || g_ixc_epoch != prior_epoch || g_ixc_sub != g_sub_serial || g_wr_epoch != prior_epoch + 1) return;
++    for (int st = 0; st < 6; st++) { NvShader *sh = pr->sh[st]; if (!sh) continue;
++        for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i];
++            if (!b->rw) continue;
++            if (b->kind != NVN_RB_SBUFP || b->reg >= 16) return;
++            if (sh->sb_ro & (1u << b->reg)) continue; // same proven bound used by encode_args
++            const p_bind_buf *u = &S.ssbo[st][b->reg];
++            if (!u->addr) continue; // encode_args binds the host's dummy buffer
++            if (!ixc_range_disjoint(u->addr, u->size)) return;
++        }
++    }
++    g_ixc_epoch = g_wr_epoch;
++}
+ // ---------- 8-bit indices written by the GPU earlier in the submission ----------
+ // Metal has no 8-bit index type, so draw widens 8-bit indices to 16-bit on the CPU at replay. When a buffer write encoded earlier in this submission (copy / update / fill,
+ // see pend_hits) covers them, the CPU reads the bytes from before that write (Tears of the Kingdom). Those draws are widened on the GPU instead: a compute pass reads the
+diff --git a/dm/gfx/tests/Makefile b/dm/gfx/tests/Makefile
+index cb90d91410..7258dcd59d 100644
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -572,3 +572,8 @@ t_tg_spill: t_tg_spill.m $(MTL_T_DEP)
+ check_t_tg_spill: t_tg_spill
+ 	MTL_DEBUG_LAYER=1 DM_NVN_DISPATCH_OWN=0 ./$<
+ 	MTL_DEBUG_LAYER=1 DM_NVN_DISPATCH_OWN=1 ./$<
++
++# Indirect cache range proof, including input offsets past output capacity.
++t_ixc_ranges: t_ixc_ranges.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ $< $(MTL_T_SRC) $(FW)
++check_t_ixc_ranges: RUN_ENV = MTL_DEBUG_LAYER=1
+diff --git a/dm/gfx/tests/t_ixc_ranges.m b/dm/gfx/tests/t_ixc_ranges.m
+new file mode 100644
+index 0000000000..f49a379fd4
+--- /dev/null
++++ b/dm/gfx/tests/t_ixc_ranges.m
+@@ -0,0 +1,40 @@
++// Range proof for preserving indirect conversions after native mesh writes.
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(c) do { checks++; if (!(c)) { failed++; fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#c); } } while (0)
++int main(void) { @autoreleasepool {
++    mtl_init(); size_t bytes = (IXC_CAP * 4 + 32767) & ~(size_t)16383;
++    void *mem = NULL; CHECK(!posix_memalign(&mem, 16384, bytes)); if (!mem) return 1;
++    memset(mem, 0, bytes); mtl_pool_add(mem, bytes); uint64_t base = (uintptr_t)mem;
++    NvShader *sh = [NvShader new]; NvProg *pr = [NvProg new]; pr->sh[4] = sh;
++    sh->rf.nb = 1;
++#define RESET() do { g_ixc_n=1; g_ixc[0]=(ixc_ent){.ind=base,.prim=7,.itype=-1}; g_ixc_epoch=100; g_wr_epoch=101; g_ixc_sub=g_sub_serial; S.ssbo[4][0]=(p_bind_buf){.addr=base+64,.size=16}; sh->rf.b[0]=(nvn_rbind){.kind=NVN_RB_SBUFP,.rw=1,.reg=0}; sh->sb_ro=0; } while (0)
++    RESET(); ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==101); CHECK(g_wr_epoch==101);
++    RESET(); S.ssbo[4][0].addr=base+15; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); S.ssbo[4][0].addr=base+16; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==101);
++    RESET(); S.ssbo[4][0].size=0; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); S.ssbo[4][0].addr=UINT64_MAX-3; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); sh->rf.b[0].kind=NVN_RB_GMEM; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); sh->rf.b[0].kind=NVN_RB_IMG; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); sh->rf.b[0].reg=16; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); g_ixc_epoch=99; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==99);
++    RESET(); g_ixc_sub=g_sub_serial+1; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); g_wr_epoch=102; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); g_ixc_n=2; g_ixc[1]=g_ixc[0]; g_ixc[1].ind=base+64; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); S.ssbo[4][0].addr=base; sh->sb_ro=1; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==101);
++    RESET(); S.ssbo[4][0].addr=0; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==101);
++    RESET(); g_ixc[0].itype=0; g_ixc[0].ibuf=base+64;
++    S.ssbo[4][0]=(p_bind_buf){.addr=base+bytes-8,.size=4}; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); g_ixc[0].itype=0; S.ssbo[4][0].addr=base+19; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); g_ixc[0].itype=0; S.ssbo[4][0].addr=base+20; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==101);
++    RESET(); g_ixc[0].ind=UINT64_MAX-3; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); g_ixc[0].ibuf=0x1234; ixc_mesh_written(pr,100); CHECK(g_ixc_epoch==100);
++    RESET(); ixc_mesh_written(nil,100); CHECK(g_ixc_epoch==100);
++    g_ixc_n=0; mtl_pool_del(mem); mtl_drain(); free(mem);
++    printf("indirect cache ranges: %d checks, %d failed\n",checks,failed); return failed!=0;
++} }

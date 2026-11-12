@@ -1,0 +1,71 @@
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index b13adf1cf4..6d8c255714 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -26,9 +26,21 @@
+ #include <TargetConditionals.h>
+ #include <unistd.h>
+ #include <sys/mman.h>
++#include <sys/sysctl.h>
+ #include <errno.h>
+ #if TARGET_OS_OSX
+-#define DM_MEM_CAP_DEFAULT_GB 24
++static inline long dm_host_mem_cap_gb(void) {
++    uint64_t mem = 0; size_t len = sizeof mem;
++    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0 && mem > 0) {
++        long gb = (long)(mem >> 30);
++        if (gb >= 64) return gb - 16;   // 64 GB Mac -> 48 GB; 128 GB -> 112 GB
++        if (gb >= 36) return gb - 8;    // 36-48 GB Mac -> 28-40 GB
++        if (gb >= 16) return gb - 4;    // 16-24 GB Mac -> 12-20 GB
++        return (gb * 3) / 4;
++    }
++    return 24;
++}
++#define DM_MEM_CAP_DEFAULT_GB dm_host_mem_cap_gb()
+ #else
+ #define DM_MEM_CAP_DEFAULT_GB 0
+ #endif
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index ba1be91efa..5ff1b11875 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -3268,7 +3268,7 @@ static void rb_swap_rows(uint8_t *p, size_t wb, size_t rows, size_t nz, size_t r
+                     if(nvn_deswz_gpu_direct_m4(g_up_ce,g_up_ct,params,poff,(__bridge id<MTLBuffer>)mb,mo,&t->d,l,view)){ok=0;break;}
+                     g_direct_dispatches++;
+                 }
+-                if(ok){[g_up_texs addObject:mt];g_direct_uploads++;if(!g_cb)up_flush();return mt;}
++                if(ok){[g_up_texs addObject:mt];g_direct_uploads++;if(!g_cb && (g_direct_uploads % 32 == 0))up_flush();return mt;}
+                 // Any encoded writes must finish before fallback copies replace
+                 // them; both versions read the same source and write all texels.
+                 [g_up_ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+@@ -3290,7 +3290,7 @@ static void rb_swap_rows(uint8_t *p, size_t wb, size_t rows, size_t nz, size_t r
+         }
+         if (enc_ok) {
+             [g_up_texs addObject:mt];
+-            if (!g_cb) up_flush();
++            if (!g_cb && (g_up_texs.count >= 32)) up_flush();
+             return mt;
+         }
+         g_nup_blits = nb0;   // Roll back the copies already recorded for this texture: the already-encoded deswizzle only writes the staging area and is harmless; this texture takes the CPU path below instead
+@@ -6056,7 +6056,7 @@ static void treg_finish_submission(void) {
+ // registrations ended in a new Metal texture view, 45% of the replay's time. A hit is checked against the current base texture (re-uploads and format-view upgrades replace it).
+ // Only live textures are cached; entries go when the texture is finalized (mtl_tex_release) or its pool is (treg_drop_pool_views), and all of them past VC_MAX textures. Under g_rmu
+ typedef struct { uint32_t pf, l0, nl, s0, ns; uint8_t tt, sw[4], pad[3]; } vc_key;
+-enum { VC_WAYS = 4, VC_MAX = 16384 };
++enum { VC_WAYS = 16, VC_MAX = 16384 };
+ typedef struct { const void *pool; unsigned next; vc_key k[VC_WAYS]; void *view[VC_WAYS];   // view: retained
+                  void *rows, *rows_of; uint64_t rows_rid, rows_n; } vc_set;   // rows: a texture buffer as 2D rows (tbuf_as_2d; retained, resident), rows_of / rows_n: the buffer texture it was made from and its element count
+ static nvn_hmap g_vc = {.klen = 8};   // texture serial → vc_set
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+index fc60dc15ac..ae339f83ba 100644
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -96,7 +96,7 @@ DM_LONGFRAME	diagnostic	`0` turns off the long-frame log (on by default), a line
+ DM_MEASURE_LOCK	path	`=<file>`: `scripts/regress.py`'s default `--lock`, the measuring lock `scripts/bench.py --lock` shares: held only while a game runs, and the harness's shader builds pause while another process holds it
+ DM_MEMSTAT	diagnostic	`=<tsv>` writes one line per second of memory accounting: footprint, Metal allocation and resident and charged memory by region class (guest, code, malloc, gpu, …)
+ DM_MEMSTAT_DUMP	diagnostic	`=<seconds>`: with `DM_MEMSTAT`, at that second writes every VM region of 1 MiB or more to `<tsv>.regions`
+-DM_MEM_CAP_GB	switch	`=<GB>`: the memory watchdog exits when resident memory exceeds that many GB (default 24 on the Mac, none on iOS; `0` turns it off)
++DM_MEM_CAP_GB	switch	`=<GB>`: the memory watchdog exits when resident memory exceeds that many GB (default sized from host RAM on the Mac: 48 GB on 64 GB, 28-40 on 36-48 GB, 12 on 16 GB; none on iOS; `0` turns it off)
+ DM_METAL_CAPTURE	diagnostic	`=1` makes `build_ipa.sh` produce a build that can write GPU frame captures (`MetalCaptureEnabled` in `Info.plist`), for `DM_GPU_CAPTURE`
+ DM_METAL_HUD	player	`1` shows Apple's Metal performance HUD over the game (frame rate, frame and GPU time, memory)
+ DM_MOTION	switch	`0` ignores live motion: every six-axis sensor lies flat as before (a shake still plays), and neither controllers' motion sensors nor the phone's device motion are switched on (`hle_hid.c`, `motion_apple.h`, `DmGamepad.m`); the NSP script's `--no-motion` (`MOTION = False`) builds it in

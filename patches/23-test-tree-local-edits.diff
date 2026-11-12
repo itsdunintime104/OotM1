@@ -1,0 +1,1032 @@
+--- a/dm/games/settings.tsv
++++ b/dm/games/settings.tsv
+@@ -18,10 +18,12 @@
+ DM_DYNAMIC_RESOLUTION	toggle	-	0	fixups:DYNAMIC_RESOLUTION	Game	Dynamic resolution	Lets the game lower its resolution under load. Turn off to keep full resolution for the selected console mode.
+ DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		level=basic
+ DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic
+-DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
++DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.	level=basic
+ DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX	game	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler
+ DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
+ DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
++DM_OUTPUT_HEIGHT	choice	0=Screen's own,1440=2560 × 1440,1080=1920 × 1080	0	platform:mac	Game	Fullscreen resolution	The picture is drawn at this size and the screen scales it up: less GPU time, a softer picture.	level=basic
++DM_MFX_INTERP	choice	0=Off,interp30=30 + 30,interpmax=Uncapped	0	platform:mac	Game	Frame generation	MetalFX makes one frame between two game frames. 30 + 30 holds the game at 30 frames a second; Uncapped keeps the frame rate setting. Experimental.	level=basic
+ DM_PICTURE_FIT	choice	fit=Fit,fill=Fill	fit	platform:ios	Game	Picture	Fill crops the game's 16:9 picture to cover the screen. Health bars, subtitles or maps near the edges can be cut off. A full-screen picture without cropping needs a patch for each game.
+ DM_SHOW_FPS	toggle	-	build:DM_SHOW_FPS	platform:ios	Game	Frame-rate counter
+ DM_TOUCH_HAPTICS	toggle	-	1	platform:ios	Controls	Touch feedback
+@@ -35,5 +37,7 @@
+ DM_PSO_MTL4	toggle	-	DM_GAME_PSO_MTL4|1	gfxapi:nvn	Performance	Metal 4 pipelines	Keeps a pipeline archive; uses more memory.
+ DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.	needs=DM_PSO_MTL4=1
+ DM_NVN_ENC_THREAD	toggle	-	1|DM_GAME_ENC_THREAD	gfxapi:nvn	Performance	Encode thread
++DM_NVN_SYNC_LAG	choice	0=Off,1=1 frame,2=2 frames	0	gfxapi:nvn	Performance	GPU overlap	Lets the game build its next frame while the GPU still draws the last one. Experimental: can show wrong pictures.	level=basic
++DM_NVN_PREENCODE	choice	0=Off,1=On	0	gfxapi:nvn	Performance	Encode ahead	Translates the next frame while the GPU still draws the last one, and sends it when the game is ready for it. Needs Encode thread on. Experimental.	level=basic
+ DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
+ DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -964,13 +964,29 @@
+ // depth-stencil state still does. The host does no ZCull, so there is nothing to set (Donkey Kong Bananza: EQUAL, 0xff)
+ NVN_NOPROTO(nvnCommandBufferSetStencilCullCriteria, void, NVNcommandBuffer *c, int func, int ref) { (void)c; (void)func; (void)ref; }
+ static _Atomic uint64_t g_sync_ns;
++static _Atomic uint64_t g_gh_sw_n[4], g_gh_sw_ns[4];   // local (gap hunt): blocked SyncWait calls and time by sync kind (index = fenced: 1 fence value, 2 acquire sync, 3 queue receipt); printed by nq_gh_report
++// local (gap hunt 4): where in the game's frame a CPU event signal comes. This thread's last blocked SyncWait return and how long it had blocked; its last AcquireTexture
++// return and how long that call took; the same returns of any thread. Read by nq_gh_release (nvn_queue.inc) on the signalling thread
++static _Thread_local uint64_t t_gh_sw_out, t_gh_sw_blocked, t_gh_acq_out, t_gh_acq_took;
++// DM_NVN_SYNC_LAG (nvn_queue.inc): this thread's AcquireTexture has returned and no SyncWait on a queue receipt has followed it yet. That next wait is the frame-start wait
++static _Thread_local int t_acq_fresh;
++int nvn_sync_wait_lag(const sync_t *s, uint64_t timeout, int lag); int nvn_sync_lag(void);
++static _Atomic uint64_t g_lag_n, g_lag_block_ns;   // frame-start waits taken with a lag, and the time they still blocked
++static _Atomic uint64_t g_gh_sw_out, g_gh_acq_out;
++static void gh_sw(unsigned kind, uint64_t ns) { atomic_fetch_add(&g_gh_sw_n[kind & 3], 1); atomic_fetch_add(&g_gh_sw_ns[kind & 3], ns); t_gh_sw_out = now_ns(); t_gh_sw_blocked = ns; atomic_store(&g_gh_sw_out, t_gh_sw_out); }
+ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
+     const sync_t *o = (const sync_t *)s;
+     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+-    if(o->fenced==3) { if(nvn_sync_wait(o,0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; uint64_t t0=now_ns(); int ok=nvn_sync_wait(o,timeout); atomic_fetch_add(&g_sync_ns,now_ns()-t0); return ok?NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED:NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; }
++    if(o->fenced==3) {
++        int lag=t_acq_fresh?nvn_sync_lag():0; t_acq_fresh=0;   // the frame-start wait (DM_NVN_SYNC_LAG, nvn_queue.inc)
++        if(lag) atomic_fetch_add(&g_lag_n,1);
++        if(nvn_sync_wait_lag(o,0,lag)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
++        uint64_t t0=now_ns(); int ok=nvn_sync_wait_lag(o,timeout,lag); uint64_t dt=now_ns()-t0; atomic_fetch_add(&g_sync_ns,dt); gh_sw(3,dt); if(lag) atomic_fetch_add(&g_lag_block_ns,dt);
++        return ok?NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED:NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
++    }
+     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
+     if (w(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+-    uint64_t t0 = now_ns(); int ok = w(o->fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
++    uint64_t t0 = now_ns(); int ok = w(o->fence, timeout); uint64_t dt = now_ns() - t0; atomic_fetch_add(&g_sync_ns, dt); gh_sw(o->fenced, dt);   // the frame's blocked SyncWait time (@sync_ms)
+     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+ }
+ NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
+@@ -1550,7 +1566,9 @@
+ // graphics gate: inside it, going to the background meanwhile (dm_gfx_suspend, on the main thread) waited for it, minutes on a first start. It stays host work for the guest scheduler. The lock
+ // comes before the gate: a second submission waiting for it must not count as in flight, or the suspend waits for it while the first waits to enter the closed gate holding the lock
+ #include "nvn_queue.inc"
++void mtl_gp_note_submit(void);   // nvn_mtl.m, local (gap hunt): the time of each game submit call, for the GPUPROF report
+ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
++    mtl_gp_note_submit();
+     ((queue_t *)q)->submits++;
+     nvn_queue_submit((queue_t *)q,n,(const uint64_t *)h);
+ }
+@@ -1689,6 +1707,8 @@
+     if (tk) { uint64_t w0 = now_ns(); nvn_queue_present_wait(tk); nvn_queue_present_release(tk); o->ticket[*idx]=0; g_pq_wait_ns += now_ns() - w0; }
+     if (s) { nvn_sync_release((sync_t *)s); ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
+     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
++    if (!dm_detclock_enabled()) { t_gh_acq_out = now_ns(); t_gh_acq_took = t_gh_acq_out - now; atomic_store(&g_gh_acq_out, t_gh_acq_out); }   // local (gap hunt 4)
++    t_acq_fresh = 1;   // DM_NVN_SYNC_LAG: the next SyncWait on a queue receipt on this thread is the frame-start wait
+     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
+ }
+ // The older API (NVN 53, Super Mario 3D World + Bowser's Fury): the queue waits for the texture on the GPU and no sync object is handed out. The host replays in submission order, so later commands already come after earlier presents; the same as WindowAcquireTexture without a sync object
+--- a/dm/gfx/nvn/nvn_mfx.h
++++ b/dm/gfx/nvn/nvn_mfx.h
+@@ -5,7 +5,9 @@
+ 
+ /* Frame interpolation mode, fixed for the run: DM_MFX_INTERP=interp30 (MFX_30): the game renders 30 frames a second and MetalFX
+    makes the frame between ("30+30"); with DM_FPS_TARGET=30 the display link runs at 60 Hz and shows the two pictures one tick
+-   each (nvn_mtl.m). MacNativeGames' other modes (every second refresh, uncapped) and its run-time switch are not wired here. */
++   each (nvn_mtl.m). Local: DM_MFX_INTERP=interpmax (MFX_MAX), MacNativeGames' uncapped mode: the game keeps its own frame rate target and every frame gets one
++   frame before it, the two pictures on two display link ticks in a row; it needs the 120 Hz link (DM_PRESENT_LINK=2). MacNativeGames' mode at every second
++   refresh and its run-time switch are not wired here. */
+ #include "nvn_mfx_mode.h"
+ const char *mfx_mode_name(int mode);
+ // Per game frame, from the replay: the scene copy (the canvas copied before the first UI draw, in the canvas format),
+--- a/dm/gfx/nvn/nvn_mfx.m
++++ b/dm/gfx/nvn/nvn_mfx.m
+@@ -124,13 +124,28 @@
+     static const char *const names[MFX_NMODES] = {"off", "30+30 (the game at 30 fps)", "half the refresh rate (50+50 on a 100 Hz display)", "uncapped (every game frame interpolated)"};
+     return m >= 0 && m < MFX_NMODES ? names[m] : "?";
+ }
++/* Local (the launcher's Frame generation row sets DM_MFX_INTERP alone, and the settings window sets DM_FPS_TARGET from its Frame rate row on every Play): interp30 needs the
++   game at 30 frames a second, so it takes the frame rate target over before anything reads it (loader.c dm_fps_state_apply, hle_fpslock.c, hle_nvn.c fps_present_cap).
++   interpmax leaves the target alone: the game runs as without interpolation and every frame it makes gets one frame before it (MacNativeGames' uncapped mode). */
++/* Frame interpolation runs with the encode thread since 2026-11-11 (local): nvn_mtl.m mfx_present_frame sends its command buffer's commit through the record stream. */
++__attribute__((constructor)) static void mfx_env(void) {
++    const char *e = getenv("DM_MFX_INTERP");
++    if (!e || (strcmp(e, "interp30") && strcmp(e, "interpmax"))) return;
++    if (!strcmp(e, "interp30")) setenv("DM_FPS_TARGET", "30", 1);
++    /* Local (2026-11-11): interpmax holds late frames (fps_hold on, whatever the profile or the launcher's Hold frames when late says). With the hold off a frame of 3 link
++       ticks shows its generated picture 1 tick and itself 2, and the frame step pays the lateness back as double steps (run B: 514 of 1,800 frames stepped 2 vsyncs, shown
++       like the others): motion speeds up and slows down. Held, a game frame stays 1 or 2 vsyncs = 2 or 4 ticks of the 120 Hz link, which the display link splits in two
++       equal halves (nvn_mtl.m: shown = period / 2), and the step is the time on screen. DM_MFX_HOLD=off keeps the profile's hold, to compare. */
++    if (!strcmp(e, "interpmax")) { const char *h = getenv("DM_MFX_HOLD"); if (!h || strcmp(h, "off")) setenv("DM_FPS_HOLD", "on", 1); }
++}
+ static void mfx_init(void) {
+     const char *e = getenv("DM_MFX_INTERP"); int v;
+     if (!e || !*e || !strcmp(e, "0")) v = MFX_OFF;
+     else if (!strcmp(e, "interp30")) v = MFX_30;
+-    else { MLOG("[RED] DM_MFX_INTERP takes interp30 or 0, got %s: frame interpolation off", e); v = MFX_OFF; }
++    else if (!strcmp(e, "interpmax")) v = MFX_MAX;
++    else { MLOG("[RED] DM_MFX_INTERP takes interp30, interpmax or 0, got %s: frame interpolation off", e); v = MFX_OFF; }
+     g_on = v;
+-    if (v) MLOG("DM_MFX_INTERP=%s: MetalFX frame interpolation, %s", e, mfx_mode_name(v));
++    if (v) MLOG("DM_MFX_INTERP=%s: MetalFX frame interpolation, %s; frame rate target %s, encode thread %s", e, mfx_mode_name(v), getenv("DM_FPS_TARGET") ?: "the game profile's", getenv("DM_NVN_ENC_THREAD") ?: "the game profile's");
+ }
+ int mfx_enabled(void) { pthread_once(&g_once, mfx_init); return g_on; }
+ 
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -1408,7 +1408,7 @@
+ // Old-queue command buffers (readback / diagnostics / present; to be deleted once M4-4 and M4-5 are migrated away): uploads are already on the Metal 4 queue, and there is no ordering guarantee between the two queues -
+ // wait for the upload to complete after flushing it, and only then can the old queue read the upload result (mtl_read_texels waited first and flushed afterwards, the readback beat the upload, 4 failures on t_nvn upload content)
+ static void up_wait_zero(_Atomic int *v, int site);
+-static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); rec_drain(); up_wait_zero(&g_up_pending, WS_OLDQ); } return [g_q commandBuffer]; }
++static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); rec_drain(); hold_force("the replay uses the old queue"); up_wait_zero(&g_up_pending, WS_OLDQ); } return [g_q commandBuffer]; }   // hold_force: DM_NVN_PREENCODE, the old queue's work must follow what is kept
+ static post_op *g_post; static int g_npost, g_postcap;
+ // One autorelease pool per submission: submissions run on a guest thread (long-lived, no run loop, never drains the implicit pool), so objects autoreleased in the Metal replay
+ // (command buffers, encoders, pass descriptors, etc.) are never released unless put in a pool. Measured on the character select screen of a real iOS device: the host heap grows by about 47 objects per frame, 0.22 MiB/s.
+@@ -1602,12 +1602,16 @@
+ // A render pass line also gives what it loaded and stored of its attachments (KB, the bandwidth ledger's view: DontCare stores are not counted) and the Metal pixel formats of
+ // colour attachment 0 and of the depth / stencil attachment (0: none)
+ enum { GP_MAX = 4096 };   // the largest timestamp heap Metal makes
+-typedef struct { char kind; uint16_t w, h; uint8_t nc, depth, loads; uint32_t draws, seg; uint64_t pass; uint32_t ld_kb, st_kb; uint16_t cfmt, dfmt; } gp_lab;   // seg: the command buffer (segment) of the submission it is in
++typedef struct { char kind; uint16_t w, h; uint8_t nc, depth, loads; uint32_t draws, seg; uint64_t pass; uint32_t ld_kb, st_kb; uint16_t cfmt, dfmt; uint64_t cpu0, cpu1; } gp_lab;   // seg: the command buffer (segment) of the submission it is in
+ static id<MTL4CounterHeap> g_gp_heap; static gp_lab g_gp_lab[GP_MAX / 2]; static int g_gp_n, g_gp_state, g_gp_cur = -1; static long g_gp_f0 = -2, g_gp_f1, g_gp_every; static uint64_t g_gp_frame;
+ static const void *g_gp_e;   // the encoder g_gp_cur belongs to: m4_end also ends the upload / diagnostics / present encoders, which may end while a profiled pass is open (#531)
+ static _Atomic int g_gp_busy;   // a periodic profile's report has not been printed yet: the heap is still being read
+ static uint64_t g_bw_load, g_bw_store, g_gp_bw_l0, g_gp_bw_s0;   // the bandwidth ledger (defined with the pass statistics below) and its values at the last render pass end
+ static uint64_t g_stat_pass, g_stat_draw; static _Atomic uint64_t g_cur_frame; static uint32_t g_seg; static uint32_t g_gp_copies, g_gp_disp, g_gp_ubd;   // copies / dispatches encoded (for the compute encoders' labels)
++/* Local (gap hunt, 2026-11-10): the GPU idles about 7 ms a frame between encoders. To see why, the report also gives, on the CPU clock, when the host began and
++   ended encoding each profiled encoder (cpu0 / cpu1) and when the game made its submit calls (mtl_gp_note_submit, from nvnQueueSubmitCommands) */
++static uint64_t g_gp_t_begin; static _Atomic uint64_t g_gp_sub_t[64]; static _Atomic unsigned g_gp_sub_n;
++void mtl_gp_note_submit(void) { unsigned i = atomic_fetch_add(&g_gp_sub_n, 1); atomic_store(&g_gp_sub_t[i & 63], mach_absolute_time()); }
+ static int gp_active(void) {
+     if (__builtin_expect(g_gp_f0 == -1, 1)) return 0;
+     if (g_gp_f0 == -2) { const char *e = getenv("DM_NVN_GPUPROF");
+@@ -1635,6 +1639,7 @@
+     gp_periodic_finish();
+     if (g_gp_every > 0 && g_gp_state == 2 && !atomic_load(&g_gp_busy)) g_gp_state = 0;   // the previous periodic profile has been reported
+     if (!gp_active() || g_gp_state == 2) return;
++    g_gp_t_begin = mach_absolute_time();
+     if (!g_gp_heap) { MTL4CounterHeapDescriptor *hd = [MTL4CounterHeapDescriptor new]; hd.type = MTL4CounterHeapTypeTimestamp; hd.count = GP_MAX; NSError *er = nil;
+         g_gp_heap = [g_dev newCounterHeapWithDescriptor:hd error:&er]; if (!g_gp_heap) { MLOG("[RED] GPUPROF: no counter heap: %s", er.description.UTF8String); g_gp_f0 = -1; return; } }
+     if (!g_gp_state) { g_gp_state = 1; g_gp_n = 0; g_gp_frame = atomic_load(&g_cur_frame); [g_gp_heap invalidateCounterRange:NSMakeRange(0, GP_MAX)]; }
+@@ -1652,7 +1657,7 @@
+ }
+ static void gp_end(id e) {   // right before that encoder ends
+     if (g_gp_cur < 0 || (__bridge const void *)e != g_gp_e) return;   // another queue's encoder: the open pass keeps its label and gets its end stamp from its own end
+-    int k = g_gp_cur; g_gp_cur = -1; g_gp_e = NULL;
++    int k = g_gp_cur; g_gp_cur = -1; g_gp_e = NULL; g_gp_lab[k].cpu0 = g_gp_t_begin; g_gp_lab[k].cpu1 = mach_absolute_time();
+     if (g_gp_lab[k].kind == 'R') { g_gp_lab[k].ld_kb = (uint32_t)((g_bw_load - g_gp_bw_l0) >> 10); g_gp_lab[k].st_kb = (uint32_t)((g_bw_store - g_gp_bw_s0) >> 10); }   // since the previous pass end (rp_end); sd_finish has set the stores
+     if (g_gp_lab[k].kind == 'R') g_gp_lab[k].draws = (uint32_t)g_stat_draw - g_gp_lab[k].draws; else { g_gp_lab[k].draws = g_gp_copies - g_gp_lab[k].draws; g_gp_lab[k].w = (uint16_t)(g_gp_disp - g_gp_lab[k].w); g_gp_lab[k].h = (uint16_t)(g_gp_ubd - g_gp_lab[k].h); }
+     if (g_gp_lab[k].kind == 'R') [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed afterStage:MTLRenderStageFragment intoHeap:g_gp_heap atIndex:2 * k + 1];
+@@ -1668,6 +1673,14 @@
+             MLOG("[gpuprof] F%llu %4d %8.1f us render pass %llu %ux%u colors %u depth %u loads %u draws %u start %+.1f seg %u load %u KB store %u KB fmt %u/%u", (unsigned long long)frame, i, us, (unsigned long long)l->pass, l->w, l->h, l->nc, l->depth, l->loads, l->draws, (a - t[0]) * tick_ns / 1e3, l->seg, l->ld_kb, l->st_kb, l->cfmt, l->dfmt); }
+         else MLOG("[gpuprof] F%llu %4d %8.1f us compute / copy after pass %llu start %+.1f seg %u copies %u (uniform updates %u) dispatches %u", (unsigned long long)frame, i, us, (unsigned long long)l->pass, (a - t[0]) * tick_ns / 1e3, l->seg, l->draws, l->h, l->w); }
+     span = (t1 - t0) * tick_ns / 1e3;
++    {   // local (gap hunt): the host's encode times of the same encoders and the game's submit calls, on the CPU clock, from the first encoder's encode start
++        mach_timebase_info_data_t tb; mach_timebase_info(&tb); double us = (double)tb.numer / tb.denom / 1e3, c0 = n ? (double)lab[0].cpu0 : 0; char b[6144]; int o = 0; b[0] = 0;
++        for (int i = 0; i < n && o < (int)sizeof b - 48; i++) o += snprintf(b + o, sizeof b - (size_t)o, " %d:%+.0f/%.0f", i, ((double)lab[i].cpu0 - c0) * us, (double)(lab[i].cpu1 - lab[i].cpu0) * us);
++        MLOG("[gpuprof] cpu F%llu encoder:encode start us/encode us:%s", (unsigned long long)frame, b);
++        o = 0; b[0] = 0; unsigned sn = atomic_load(&g_gp_sub_n);
++        for (unsigned j = sn > 60 ? sn - 60 : 0; j < sn && o < (int)sizeof b - 48; j++) { double t = ((double)atomic_load(&g_gp_sub_t[j & 63]) - c0) * us; if (t > -40000 && t < 60000) o += snprintf(b + o, sizeof b - (size_t)o, " %+.0f", t); }
++        MLOG("[gpuprof] cpu F%llu game submit calls, us on the same clock:%s", (unsigned long long)frame, b);
++    }
+     MLOG("[gpuprof] frame %llu: render %.2f ms, compute / copy %.2f ms over %d encoders (%d render passes, attachments load %.1f MB store %.1f MB), first start to last end %.2f ms", (unsigned long long)frame, tot[0] / 1e3, tot[1] / 1e3, n, np, ld / 1024.0, st / 1024.0, span / 1e3);
+     free(lab); atomic_store(&g_gp_busy, 0);
+ }
+@@ -2459,6 +2472,27 @@
+     pthread_mutex_lock(&g_mu); if (fence > g_done) g_done = fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+     nvn_queue_gpu_progress();
+ }
++// Local (gap hunt 6, not for upstream): what the GPU does between the command buffers of a frame. From each commit's feedback (submission, segment, upload batch): the GPU
++// time inside the command buffer, and the time from the end of the latest one before it to its start: under 5 ms = idle between two command buffers of a frame, longer = idle
++// between frames. Read by nvn_queue.inc every 300 frames (mtl_gspan_stats)
++static pthread_mutex_t g_gspan_mu = PTHREAD_MUTEX_INITIALIZER; static double g_gspan_end; static uint64_t g_gspan[6];   // command buffers, ns inside, short gaps, their ns, long gaps, their ns
++static void gspan_note(double s, double e) {
++    if (!(s > 0) || e < s) return;
++    pthread_mutex_lock(&g_gspan_mu);
++    g_gspan[0]++; g_gspan[1] += (uint64_t)((e - s) * 1e9);
++    if (g_gspan_end > 0 && s > g_gspan_end) { double g = s - g_gspan_end; int k = g > 0.005 ? 4 : 2; g_gspan[k]++; g_gspan[k + 1] += (uint64_t)(g * 1e9); }
++    if (e > g_gspan_end) g_gspan_end = e;
++    pthread_mutex_unlock(&g_gspan_mu);
++}
++void mtl_gspan_stats(uint64_t *v) { pthread_mutex_lock(&g_gspan_mu); memcpy(v, g_gspan, sizeof g_gspan); pthread_mutex_unlock(&g_gspan_mu); }
++// local (hitch hunt): one command buffer that the GPU held for 20 ms or longer, one line each, the first 200. A frame's 29 command buffers take 26 ms together, and in a hitch
++// frame the same amount of work took 85 to 159 ms (run 1c, frames 3032 and 4416) with no upload, no new pipeline and no allocator wait. The line names which submission was slow
++static void slowcb_note(uint64_t f, uint64_t fence, double g0, double g1, const char *what) {
++    static _Atomic int n;
++    if (!(g0 > 0) || g1 - g0 < 0.020 || atomic_fetch_add(&n, 1) >= 200) return;
++    MLOG("[slowcb] frame %llu fence %llu: the GPU held one command buffer for %.1f ms (start %.3f s, end %.3f s): %s", (unsigned long long)f, (unsigned long long)fence,
++         (g1 - g0) * 1e3, gpu_s_guest_ns(g0) / 1e9, gpu_s_guest_ns(g1) / 1e9, what);
++}
+ static _Atomic int g_seg_inflight;   // main command buffers committed and not reported back yet (sub_cut)
+ static void rt_preserve_bound(void);
+ static void queue_program_preserve(void);
+@@ -2496,7 +2530,8 @@
+     pthread_mutex_unlock(&g_post_mu);
+     int lost_test = gpu_lost_test();
+     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
+-        gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
++        gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime); gspan_note(cb.GPUStartTime, cb.GPUEndTime);
++        slowcb_note(gpu_f, fence, cb.GPUStartTime, cb.GPUEndTime, cctx.UTF8String);
+         if (ws_on()) ws_fb(fence, cb.GPUEndTime);
+         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
+         if (cb.error) { atomic_store(&g_last_commit_error, 1); res_top_once(cb.error); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
+@@ -2533,8 +2568,18 @@
+ static void post_early(uint64_t fence) {
+     post_complete(fence, 0, 0);
+ }
+-static int mtl_wait_at(uint64_t fence, uint64_t timeout_ns, int site) {
++static int mtl_wait_at_body(uint64_t fence, uint64_t timeout_ns, int site);
++static int mtl_wait_at(uint64_t fence, uint64_t timeout_ns, int site) {   // local diagnostic (hitch study): a wait that blocks is listed while it lasts (nvn_rec.h hold_force prints the list)
++    if (!timeout_ns || g_done >= fence) return mtl_wait_at_body(fence, timeout_ns, site);
++    int sub = on_sub_thread(), slot = -1;
++    if (sub) hw_in(site); else slot = hw_wait_in(fence);
++    int ok = mtl_wait_at_body(fence, timeout_ns, site);
++    if (sub) hw_out(); else hw_wait_out(slot);
++    return ok;
++}
++static int mtl_wait_at_body(uint64_t fence, uint64_t timeout_ns, int site) {
+     if (g_done >= fence) { if (ws_on()) ws_put(site, 0, 0); return 1; }
++    if (timeout_ns && atomic_load_explicit(&g_hold_open, memory_order_relaxed) && fence >= atomic_load(&g_hold_first) && on_sub_thread()) hold_force("the replay thread waits for held work");   // DM_NVN_PREENCODE: it would wait for itself
+     uint64_t w0 = ws_t0();
+     if ((site == WS_SYNC || site == WS_SYNC_NEWEST || site == WS_ACQ) && fast_wake() && g_ev && fence <= g_fence) {   // the game's own wait: wake on the GPU's signal (rec_signal(g_ev, fence) after each submission)
+         uint64_t ms = timeout_ns / 1000000ull; if (ms > 3600000ull) ms = 3600000ull;
+@@ -3124,10 +3169,12 @@
+ static void up_wake(void) { pthread_mutex_lock(&g_up_wmu); pthread_cond_broadcast(&g_up_wcv); pthread_mutex_unlock(&g_up_wmu); }
+ static void up_wait_zero(_Atomic int *v, int site) {
+     if (!atomic_load(v)) { if (ws_on()) ws_put(site, 0, 0); return; }
+-    uint64_t w0 = ws_t0();
++    uint64_t w0 = ws_t0(); int sub = on_sub_thread();   // sub, hw_in, hw_out: local diagnostic (hitch study)
++    if (sub) hw_in(site);
+     pthread_mutex_lock(&g_up_wmu);
+     while (atomic_load(v)) { struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 10000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } pthread_cond_timedwait(&g_up_wcv, &g_up_wmu, &dl); }
+     pthread_mutex_unlock(&g_up_wmu);
++    if (sub) hw_out();
+     if (ws_on()) ws_put(site, w0, 1);
+ }
+ static unsigned g_up_seq;
+@@ -3196,6 +3243,7 @@
+     MTL4CommitOptions *o = [MTL4CommitOptions new];
+     atomic_fetch_add(&g_up_pending, 1);
+     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
++        gspan_note(f.GPUStartTime, f.GPUEndTime);   // local (gap hunt 6)
+         if (f.error) { MLOG("[RED] upload command buffer execution error: %s", f.error.description.UTF8String); res_top_once(f.error); gpu_lost_check(f.error, "upload"); }
+         if (f.error || fake_lost) {
+             os_unfair_lock_lock(&g_up_lost_lk); if (!g_up_lost) g_up_lost = [NSHashTable weakObjectsHashTable]; for (id d in dsts) [g_up_lost addObject:d]; int n = (int)g_up_lost.allObjects.count; atomic_store(&g_up_lost_n, n); os_unfair_lock_unlock(&g_up_lost_lk);
+@@ -4788,12 +4836,21 @@
+     return v[i];
+ }
+ static int mfx_probe(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_MFX_PROBE"); v = e && atoi(e) > 0; } return v; }
++/* Local (Ocarina): the scene reaches the canvas without a draw (probe 2026-11-10: the 1440x810 scene is scaled into the 1920x1080 RG11B10F canvas by compute; every draw
++   into the canvas blends), so no scene_upscale key exists. DM_MFX_SCENE_FIRST=1: the frame's first draw into the canvas is the first UI draw. And the scene is drawn forward,
++   one colour target with a D32F depth: DM_MFX_DEPTH=<colour targets>:<least width> replaces the rule "three or more colour targets, 320 wide or more" for the depth pass */
++static int mfx_scene_first(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_MFX_SCENE_FIRST"); v = e && atoi(e) > 0; } return v; }
++static void mfx_depth_rule(int *nc, int *minw) {
++    static int v[2], init;
++    if (!init) { init = 1; v[0] = 3; v[1] = 320; const char *e = getenv("DM_MFX_DEPTH"); int a, b; if (e && sscanf(e, "%d:%d", &a, &b) == 2 && a >= 1 && b >= 64) { v[0] = a; v[1] = b; } }
++    *nc = v[0]; *minw = v[1];
++}
+ static char g_mfx_mask_mark;
+ #define MFX_MASK_MARK ((const void *)&g_mfx_mask_mark)   /* pso_key fsfn: a UI draw whose copy function is not available (yet): attachment 7 masked */
+ static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int nswap, scene_done, ui_cleared, depth_done, want_cam, role, ready, pass_mfx, swap_draws, ui_lost; uint64_t frames, noui, fused, resets, lost, scene_canvas, prev_scene_canvas; __weak id<MTLTexture> canvas_tex; } g_mfx;   // canvas_tex: the texture this frame's upscale drew into; scene_canvas: the canvas this frame's scene came from
+ static int mfx_on(void) {   // DM_MFX_INTERP set and the profile names the scene's upscale draw and the camera block
+     static int ok = -1;
+-    if (ok < 0) { ok = (mfx_scene_key()[0] && mfx_cam(2)) || mfx_probe(); if (!ok && mfx_enabled()) MLOG("[RED] [mfx] DM_MFX_INTERP: this game's profile has no scene_upscale and camera_block keys; frame interpolation off"); }
++    if (ok < 0) { ok = ((mfx_scene_key()[0] || mfx_scene_first()) && mfx_cam(2)) || mfx_probe(); if (!ok && mfx_enabled()) MLOG("[RED] [mfx] DM_MFX_INTERP: this game's profile has no scene_upscale and camera_block keys; frame interpolation off"); }
+     return ok && mfx_enabled();
+ }
+ static int g_rp_layered;   // the pass about to open is for a vertex shader that writes the layer (draw → rp_begin_ex)
+@@ -5399,9 +5456,9 @@
+             g_mfx.last_c0 = t0->serial;
+         }
+     }
+-    if (!g_mfx.depth_done && dt && c0 && dt.pixelFormat == MTLPixelFormatDepth32Float && dt.width == c0.width && dt.height == c0.height && dt.width >= 320) {
++    if (!g_mfx.depth_done && dt && c0 && dt.pixelFormat == MTLPixelFormatDepth32Float && dt.width == c0.width && dt.height == c0.height) { int need, minw; mfx_depth_rule(&need, &minw);
+         int nc = 0; for (int i = 0; i < R.rt.n && i < 8; i++) nc += pd.colorAttachments[i].texture != nil;
+-        if (nc >= 3) { mfx_note_depth(dt); g_mfx.depth_done = 1; g_mfx.want_cam = 1; }
++        if (nc >= need && (int)dt.width >= minw) { mfx_note_depth(dt); g_mfx.depth_done = 1; g_mfx.want_cam = 1; }
+     }
+     if (clear_only != 1 && t0 && c0 && g_mfx.scene_done && g_mfx.canvas == t0->serial && R.rt.n <= 7 && pd.colorAttachments[0].level == 0 && !pd.colorAttachments[7].texture) {
+         if (fz_active()) { g_mfx.ui_lost |= 4; if (!g_mfx.fused++) MLOG("[RED] [mfx] a canvas pass after the scene copy is a merged pass: its UI draws stay out of the UI layer"); return; }
+@@ -8080,6 +8137,10 @@
+                 MTLCompileOptions *o = [MTLCompileOptions new]; o.preserveInvariance = YES;   // as dmsh_build.py's -fpreserve-invariance
+                 NSError *err = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:o error:&err];
+                 id<MTLFunction> f = lib ? [lib newFunctionWithName:name] : nil;
++                // local: a source that declares function constants (dm_border_off since #1929, the only one in the chain's sources) must be specialized before a pipeline takes it,
++                // or Metal's validation aborts ("fragmentFunction main0 cannot be used to build a pipeline state", build 5 on 2026-11-11). An empty set keeps every default
++                // (border corrections live, as before #1929; as shader_load's fn_spec). The copy stays on the MTLDevice path, so the device specializes it here, on this queue
++                if (f.functionConstantsDictionary.count) f = [lib newFunctionWithName:name constantValues:[MTLFunctionConstantValues new] error:&err];
+                 if (f) result = f; else MLOG("[RED] [mfx] fragment shader %s, UI copy (role %d): %s", key, role, err.localizedDescription.UTF8String);
+             } else MLOG("[RED] [mfx] fragment shader %s: colour 0 (%s) cannot be copied to the UI layer; its draws stay out of it", key, type ? type.UTF8String : "none");
+         }
+@@ -13266,7 +13327,9 @@
+     rec_commit(g_cb, nil);
+     if (!g_mdi_ev) g_mdi_ev = [g_dev newSharedEvent];
+     rec_signal(g_mdi_ev, ++g_mdi_v); rec_drain();
++    hw_in(WS_MDI);   // local diagnostic (hitch study)
+     uint64_t w0 = ws_t0(); int ok = [g_mdi_ev waitUntilSignaledValue:g_mdi_v timeoutMS:10000]; if (ws_on()) ws_put(WS_MDI, w0, 1);
++    hw_out();
+     if (!ok) RED_ONCE(97, "indirect-count multi-draw: the GPU did not finish within 10 s; the count is read anyway");
+     else drw_drained();
+     g_cb = rec_cb_new();
+@@ -13981,6 +14044,7 @@
+     if (mfx_probe() && mfx_on() && pr && R.rt.n > 0 && R.rt.color[0] && !g_defer_replaying) mfx_probe_draw(pr->sh[1] ? pr->sh[1]->key : "(none)", R.rt.color[0], S.color.blend_en & 1);
+     if (mfx_on() && pr && R.rt.n > 0 && R.rt.color[0] && !g_defer_replaying) {   // frame interpolation (g_mfx); before vbuf_prepare: the scene copy may end the pass
+         if (mfx_to_swap(R.rt.color[0]->serial) && g_mfx.swap_draws++) g_mfx.ui_lost |= 1;   // a draw into the presented texture after the first (the canvas copy): UI the canvas never holds
++        if (mfx_scene_first() && !g_mfx.ready && g_mfx.canvas && R.rt.color[0]->serial == g_mfx.canvas) { g_mfx.ready = 1; g_mfx.canvas_tex = tex_mtl(R.rt.color[0]); }   // local (Ocarina): the first draw into the canvas is UI
+         if (pr->sh[1] && !strncmp(pr->sh[1]->key, mfx_scene_key(), 16)) {   // the upscale draw into the canvas: after it the canvas holds the finished scene
+             if (R.rt.color[0]->serial == g_mfx.canvas) { g_mfx.ready = 1; g_mfx.canvas_tex = tex_mtl(R.rt.color[0]); }
+         }
+@@ -14003,6 +14067,13 @@
+         int r = g_mfx.pass_mfx ? (S.color.blend_en & 1 ? MFX_ROLE_UI : MFX_ROLE_UI_OPAQUE) : 0;
+         if (r != g_mfx.role) { g_mfx.role = r; g_pso_dirty = 1; }
+         if (r == MFX_ROLE_UI && mfx_blend_reads_dst(&S.blend[0])) g_mfx.ui_lost |= 8;   // its result depends on the scene under it: the UI layer cannot hold it, mfx_ui_repair corrects the layer from the canvas
++        if (r) {   // local (Ocarina, diagnostic): each fragment shader and blend drawn in the HUD role, logged once, in draw order: which draws make the repair run
++            static struct { char key[17]; int s, d; } seen[48]; static int nseen; const char *fk = pr && pr->sh[1] ? pr->sh[1]->key : "-"; int bs = (int)S.blend[0].src_rgb, bd = (int)S.blend[0].dst_rgb, k = 0;
++            while (k < nseen && (strncmp(seen[k].key, fk, 16) || seen[k].s != bs || seen[k].d != bd)) k++;
++            if (k == nseen && nseen < 48) { snprintf(seen[nseen].key, sizeof seen[nseen].key, "%.16s", fk); seen[nseen].s = bs; seen[nseen].d = bd; nseen++;
++                MLOG("[mfx] HUD-role draw %d: fragment %.16s role %d (3 = opaque, other = blended) blend source %d destination %d advanced %d reads-destination %d, first seen at game frame %llu", nseen, fk, r, bs, bd, (int)S.blend[0].adv,
++                     r == MFX_ROLE_UI && mfx_blend_reads_dst(&S.blend[0]), (unsigned long long)atomic_load(&g_cur_frame)); }
++        }
+     }
+     if (g_mfx.want_cam) mfx_take_camera();
+     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
+@@ -15204,7 +15275,8 @@
+     atomic_fetch_add(&g_seg_inflight, 1);
+     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
+         atomic_fetch_sub(&g_seg_inflight, 1);
+-        gpu_tag_done(f, cb.GPUStartTime, cb.GPUEndTime);
++        gpu_tag_done(f, cb.GPUStartTime, cb.GPUEndTime); gspan_note(cb.GPUStartTime, cb.GPUEndTime);
++        { char w[48]; snprintf(w, sizeof w, "segment %u cut from its submission", k); slowcb_note(f, cbs_fence, cb.GPUStartTime, cb.GPUEndTime, w); }
+         if (sc) { if (k < SEG_CLK_N) { atomic_store(&sc->t[k][0], gpu_s_guest_ns(cb.GPUStartTime)); atomic_store(&sc->t[k][1], gpu_s_guest_ns(cb.GPUEndTime)); } seg_clk_put(sc); }
+         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int k; if (k++ < 8) MLOG("[RED] segment command buffer execution error: %s", cb.error.description.UTF8String); res_top_once(cb.error); }
+         char where[64]; snprintf(where, sizeof where, "fence %llu, segment %u", (unsigned long long)cbs_fence, k); cbs_feedback(cbs, cb.error, where);
+@@ -16476,7 +16548,8 @@
+ // Swapchain texture return: before AcquireTexture gets a texture it waits for the ticket of that texture's previous present to be processed (mtl_present_wait), after which the commands the game draws into it
+ // are necessarily ordered after that blit on the GPU queue.
+ #define PQ 8
+-typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, snap_v; int interp, interp_shown; double interp_ts; } pq_item;   // interp (frame interpolation): output slot of the frame shown before this one (-1 none); interp_shown: it is up   // snap_v: the snapshot copy this present shows (snap_commit_wait)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
++typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, snap_v; int interp, interp_shown; double interp_ts; uint64_t interp_v; } pq_item;   // interp (frame interpolation): output slot of the frame shown before this one (-1 none); interp_shown: it is up   // snap_v: the snapshot copy this present shows (snap_commit_wait)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev   // interp_v: the note value of the interpolated frame's command buffer (0 = committed directly)
++static _Atomic uint64_t g_mfx_cmt;   // encode thread: the newest interpolation command buffer that reached the queue (a note); see mfx_present_frame
+ // External producer (the Vulkan layer, dm/gfx/vk) renders on its own queue and signals this event when a frame's rendering is done: the present of that frame waits for the value on g_q4
+ static id<MTLSharedEvent> g_ext_ev;
+ static void ext_wait(uint64_t v) { if (v && g_ext_ev) [g_q4 waitForEvent:g_ext_ev value:v]; }
+@@ -16545,8 +16618,9 @@
+     pq_item *fp = &g_pq[(first - 1) % PQ]; int behind = 0;
+     if (fp->interp >= 0 && fp->interp_shown) ticket = first;
+     else if (fifo && ticket > first) { behind = ticket - first >= 2; ticket = behind ? g_pq_in - 1 : first; }
+-    pq_item *ip = &g_pq[(ticket - 1) % PQ]; int interp = !behind && ip->interp >= 0 && !ip->interp_shown ? ip->interp : -1;
++    pq_item *ip = &g_pq[(ticket - 1) % PQ]; int late = ip->interp >= 0 && atomic_load(&g_mfx_cmt) < ip->interp_v; int interp = !behind && ip->interp >= 0 && !ip->interp_shown && !late ? ip->interp : -1;
+     if (interp >= 0) { ip->interp_shown = 1; ip->interp_ts = update.targetPresentationTimestamp; }
++    if (late && !behind && !ip->interp_shown) { static unsigned n; if (++n <= 3 || n % 100 == 0) MLOG("[mfx] generated picture not shown: its command buffer had not reached the queue (%u so far)", n); }
+     pq_item it = *ip; g_link_it_tin = it.t_in;
+     g_pq_read = interp >= 0 ? ticket - 1 : ticket;
+     if (ticket > first) { g_link_dropped += ticket - first; for (uint64_t k = first; k < ticket; k++) { g_pres[k % PRING] = (pres_ent){k, -1}; mtl_tex_unpin(g_pq[(k-1)%PQ].t.serial); } }   // Old frames merged and dropped are recorded as "not presented", so the present statistics honestly count them as dropped frames
+@@ -16557,6 +16631,19 @@
+     int submitted;
+     ext_wait(it.ev_val); snap_commit_wait(it.snap_v);
+     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp, interp); if (interp < 0) mtl_tex_unpin(it.t.serial); }
++    if (submitted && mfx_on()) {   // Local diagnostic (frame generation pacing): how long each picture stays on screen, by the display's target times, and the game's present period
++        static double prev_ts, sum[2]; static int prev_gen = -1; static unsigned n, h[2][5], per[2];
++        double ts = update.targetPresentationTimestamp;
++        if (prev_gen >= 0 && ts > prev_ts) { int k = (int)((ts - prev_ts) * 120 + 0.5); k = k < 1 ? 1 : k > 5 ? 5 : k; h[prev_gen][k - 1]++; sum[prev_gen] += ts - prev_ts; }
++        prev_ts = ts; prev_gen = interp >= 0;
++        if (interp < 0) per[it.period > 0.025]++;
++        if (++n % 600 == 0) {
++            unsigned c[2]; for (int kind = 0; kind < 2; kind++) c[kind] = h[kind][0] + h[kind][1] + h[kind][2] + h[kind][3] + h[kind][4];
++            MLOG("[mfx] on screen, 600 pictures to game frame %llu: a generated picture stayed up 8 ms %u, 17 ms %u, 25 ms %u, 33 ms %u, longer %u (mean %.1f ms); a real picture 8 ms %u, 17 ms %u, 25 ms %u, 33 ms %u, longer %u (mean %.1f ms); the game's present period: up to 25 ms %u frames, above %u",
++                 (unsigned long long)it.frame, h[1][0], h[1][1], h[1][2], h[1][3], h[1][4], c[1] ? sum[1] / c[1] * 1e3 : 0.0, h[0][0], h[0][1], h[0][2], h[0][3], h[0][4], c[0] ? sum[0] / c[0] * 1e3 : 0.0, per[0], per[1]);
++            memset(h, 0, sizeof h); sum[0] = sum[1] = 0; per[0] = per[1] = 0;
++        }
++    }
+     double shown = it.interp >= 0 && it.interp_shown ? it.period / 2 : it.period;   // frame interpolation: each of the two pictures for half the frame's period (30+30: one 60 Hz tick each); a frame shown without its interpolated one keeps its whole period
+     g_link_hold_until = submitted && shown > (it.interp >= 0 && it.interp_shown ? 0.0125 : 0.025) ? update.targetPresentationTimestamp + shown : 0;   // without interpolation as before: only intervals of 2 or more
+     if (!submitted && interp < 0) {
+@@ -16647,6 +16734,9 @@
+     static int vrr_was; int vrr = want == 1 && link_vrr_120();   // variable-refresh fullscreen that kept its mode: the 120 Hz link paces the 60 (link_vrr_120)
+     if (vrr != vrr_was) { vrr_was = vrr; MLOG("display link: %s (frame %llu)", vrr ? "120 Hz in fullscreen on a variable-refresh screen, a frame every other tick (DM_PRESENT_LINK=1 keeps 60 Hz)" : "60 Hz again (window, fixed-rate screen or another frame rate)", (unsigned long long)atomic_load(&g_cur_frame)); }
+     if (vrr) want = 2;
++    // Local: uncapped frame interpolation (DM_MFX_INTERP=interpmax) shows a frame's two pictures on two ticks in a row (the callback above holds neither: half of a
++    // 1/60 s period is below its 12.5 ms threshold), so on the 60 Hz link a game frame takes 1/30 s. It needs the 120 Hz link
++    if (want == 1 && mfx_on() && mfx_enabled() == MFX_MAX) { static int said; if (!said++) MLOG("[RED] [mfx] uncapped frame interpolation on the 60 Hz display link: each game frame takes two ticks, so 30 game frames a second at most. Set DM_PRESENT_LINK=2 (the 120 Hz link)"); }
+     // The screen's rate changed (switched by front_screen_match, or another screen): the range again, virtual ticks or none. Taken only once the link object exists, so a change
+     // while its thread starts (after link_main read the rate) is not lost
+     static int hz_was; int hz = front_screen_max_fps(); CAMetalDisplayLink *lk = g_link;
+@@ -16700,7 +16790,7 @@
+         // Frame interpolation: the interpolated frame for at least one refresh (at most half the frame), then the game frame for half the frame. Skipped when a newer
+         // game frame is already queued: two pictures per frame would fall further and further behind
+         pthread_mutex_lock(&g_pq_mu); int behind = g_pq_read < g_pq_in; pthread_mutex_unlock(&g_pq_mu);
+-        int show_interp = it.interp >= 0 && !behind;
++        int show_interp = it.interp >= 0 && !behind && atomic_load(&g_mfx_cmt) >= it.interp_v;
+         if (show_interp) { static double tick; if (!tick) { int hz = mtl_display_hz(); tick = 1.0 / (hz > 0 ? hz : 60); }
+             @autoreleasepool { (void)present_now(&it.t, fmin(it.period / 2, tick), it.frame, ticket, it.crop, nil, 0, it.interp); } }
+         @autoreleasepool { submitted = present_now(&it.t, show_interp ? it.period / 2 : it.period, it.frame, ticket, it.crop, nil, 0, -1); mtl_tex_unpin(it.t.serial); }
+@@ -16847,13 +16937,15 @@
+ /* Frame interpolation at the game's present (game thread; this frame's work is committed, the next frame's not begun): remember the presented texture for the canvas
+    search, then in a command buffer of its own (GPU order: after this frame, before the next) the motion vectors and the frame between the previous and this one.
+    A frame that drew no UI into the canvas (the idle camera hides the HUD) never reached the scene copy: its canvas, which holds the whole picture, is the scene and
+-   the UI layer is cleared. Resets the per-frame state. Returns the output slot of the interpolated frame, or -1. Not with the encode thread (rec_on): its blocks
+-   order the queue, and this buffer would go ahead of the frame */
++   the UI layer is cleared. Resets the per-frame state. Returns the output slot of the interpolated frame, or -1. With the encode thread (rec_on) the buffer is encoded
++   here, on the submit thread, and only its commit goes through the record stream (rec_commit_upload), behind the frame's recorded work; a queue block after it sets the note
++   g_mfx_cmt, and the present shows the generated picture only when its note is reached */
+ static id<MTL4CommandAllocator> g_mfx_alloc[3]; static id<MTL4CommandBuffer> g_mfx_cb[3]; static _Atomic int g_mfx_busy[3];
+-static int mfx_present_frame(const tex_t *t, double period) { @autoreleasepool {
++static uint64_t g_mfx_cmt_v;   // the number given to the last interpolation command buffer (submit thread only); g_mfx_cmt (declared after pq_item) is the newest one that reached the queue
++static int mfx_present_frame(const tex_t *t, double period, uint64_t *cmt_v) { @autoreleasepool {
++    *cmt_v = 0;
+     mfx_note_swap(t);
+     int a = -1; for (int i = 0; i < 3 && a < 0; i++) if (!atomic_load(&g_mfx_busy[i])) a = i;
+-    if (rec_on()) { static int said; if (!said++) MLOG("[RED] [mfx] frame interpolation does not run with the encode thread (DM_NVN_ENC_THREAD=0 turns it off)"); a = -1; }
+     id<MTL4CommandBuffer> cb = nil;
+     if (a >= 0 && !g_mfx_alloc[a]) { g_mfx_alloc[a] = [g_dev newCommandAllocator]; g_mfx_cb[a] = [g_dev newCommandBuffer]; if (!g_mfx_alloc[a] || !g_mfx_cb[a]) MDIE("frame interpolation: no command allocator / buffer"); }
+     id<MTLTexture> canvas = g_mfx.canvas_tex;
+@@ -16901,7 +16993,12 @@
+         [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)keep; if (f.error) MLOG("[RED] [mfx] interpolation command buffer: %s", f.error.description.UTF8String);
+             if (f.GPUEndTime > f.GPUStartTime) mfx_note_gpu((f.GPUEndTime - f.GPUStartTime) * 1e3);
+             atomic_store(busy, 0); }];
+-        pthread_mutex_lock(&g_res_mu); [g_q4 commit:&cb count:1 options:o]; pthread_mutex_unlock(&g_res_mu);
++        if (rec_on() && g_rb_started) {   // in order with the frame's recorded commits, kept with them while a hold is on
++            uint64_t v = ++g_mfx_cmt_v; *cmt_v = v;
++            rec_commit_upload(cb, o);
++            rec_queue_block(^{ rec_note_set(&g_mfx_cmt, v); });
++            rec_publish();   // reaches the encode thread now, not with the next frame's first segment (as the segment cut does)
++        } else { pthread_mutex_lock(&g_res_mu); [g_q4 commit:&cb count:1 options:o]; pthread_mutex_unlock(&g_res_mu); }
+         mfx_mv_log();   // DM_MFX_MVLOG (diagnostic)
+         if (keep && mfx_dump_due()) { while (atomic_load(&g_mfx_busy[a])) usleep(200); mfx_dump((long)atomic_load(&g_cur_frame), nil, nil); }   // DM_MFX_DUMP (diagnostic): waits for the GPU
+     }
+@@ -16929,7 +17026,7 @@
+         else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL: resuming the display link (frame %llu)", (unsigned long long)atomic_load(&g_cur_frame)); }
+     }
+     if (ws_on()) { static uint64_t f0; uint64_t f = atomic_load(&g_cur_frame); if (!f0) f0 = f; else if (f >= f0 + 300) { ws_report(f, f - f0); f0 = f; } }
+-    int islot = t && !ev_val && mfx_on() ? mfx_present_frame(t, period) : -1;   // frame interpolation: the frame shown before this one
++    uint64_t icv = 0; int islot = t && !ev_val && mfx_on() ? mfx_present_frame(t, period, &icv) : -1;   // frame interpolation: the frame shown before this one
+     tex_t snap; uint64_t ss = 0; int slot = 0;
+     if (!ev_val && mtl_snap_on()) {
+         slot = (int)(atomic_load(&g_snap_next) % (uint64_t)g_snap_n);
+@@ -16938,7 +17035,7 @@
+     mtl_tex_pin(t->serial);
+     pthread_mutex_lock(&g_pq_mu);
+     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // Wait only when the queue is full; normally AcquireTexture blocks first
+-    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, ss ? g_snap[slot].ev : 0, islot, 0, 0};
++    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, ss ? g_snap[slot].ev : 0, islot, 0, 0, icv};
+     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
+     uint64_t tk = ++g_pq_in;
+     if (ss) { g_snap[slot].ticket = tk; atomic_fetch_add(&g_snap_next, 1); }
+--- a/dm/gfx/nvn/nvn_queue.inc
++++ b/dm/gfx/nvn/nvn_queue.inc
+@@ -7,15 +7,19 @@
+ // Ready continuations of NVN queues share the renderer's one ordered Metal queue.
+ // An unresolved wait parks its queue, never the submitting CPU or another queue.
+ typedef struct nq_receipt { unsigned refs, published; uint64_t fence, present; } nq_receipt;
++typedef struct nq_sig { volatile uint32_t *word; unsigned mode; uint32_t value; } nq_sig;
+ typedef struct nq_node {
+     struct nq_node *next;
+     uint8_t *bytes; size_t length, capacity;
+     unsigned kind, mode, closed, waiting; volatile uint32_t *event; uint32_t value;
++    nq_sig *sigs; unsigned nsigs, csigs;   // every OP_SIGNAL_EVENT of a commands node, in order (nq_sig_add); event / mode / value above hold only the last one
+     uint64_t wait_fence, event_predecessor; unsigned wait_kind; const sync_t *sync_source; nq_receipt *receipt;
+     tex_t texture; double period; int crop[4];
++    uint64_t pres_index;   // a present node: its number in the order the game queued presents (nq_pres_made), for DM_NVN_SYNC_LAG
++    uint64_t park_t0; unsigned park_class;   // local (gap hunt): when replay first parked on this wait node, and why (nq_gh_park)
+ } nq_node;
+ typedef struct nq_owned { struct nq_owned *next; unsigned kind; uint64_t data[]; } nq_owned;
+-typedef struct nq_job { struct nq_job *next; nq_node *first, *last; nq_receipt *receipt; nq_owned *owned; nvn_hmap objects; uint64_t frame; } nq_job;
++typedef struct nq_job { struct nq_job *next; nq_node *first, *last; nq_receipt *receipt; nq_owned *owned; nvn_hmap objects; uint64_t frame; uint64_t t_enq; /* local (gap hunt 5): when a submit queued it */ } nq_job;
+ static void nq_job_free(nq_job *j) {
+     for(nq_owned *o=j->owned,*next;o;o=next) { next=o->next; if(o->kind==CAP_K_PROG) mtl_prog_unpin((prog_t *)o->data); else if(o->kind==CAP_K_TEX) mtl_tex_unpin(((tex_t *)o->data)->serial); free(o); }
+     free(j->objects.keys); free(j->objects.vals); free(j);
+@@ -57,6 +61,11 @@
+ }
+ 
+ enum { NQ_COMMANDS, NQ_EVENT, NQ_SYNC, NQ_FENCE, NQ_PRESENT };
++static int nq_sig_all(void) { static int v=-1; if(v<0) { const char *e=getenv("DM_NVN_SIG_ALL"); v=!(e && !strcmp(e,"0")); LOG("[nvn] queued event writes: %s (DM_NVN_SIG_ALL)", v?"every signal of a command node":"the last signal of a command node only"); } return v; }
++static void nq_sig_add(nq_node *n) {   // the signal just read into n->event / mode / value joins the node's list
++    if(n->nsigs==n->csigs) { n->csigs=n->csigs?n->csigs*2:8; n->sigs=realloc(n->sigs,n->csigs*sizeof *n->sigs); if(!n->sigs) die("queue signal list allocation failed"); } // NOLINT(bugprone-suspicious-realloc-usage): allocation failure aborts
++    n->sigs[n->nsigs++]=(nq_sig){n->event,n->mode,n->value};
++}
+ static nq_receipt *nq_new(void) { nq_receipt *r=calloc(1,sizeof *r); if(!r) die("queue receipt allocation failed"); r->refs=1; return r; }
+ static void nq_put(nq_receipt *r) { if(r && !--r->refs) free(r); }
+ static void nq_set_sync(sync_t *s,nq_receipt *r) { if(s->fenced==3) nq_put((nq_receipt *)(uintptr_t)s->fence); r->refs++; s->fence=(uintptr_t)r; s->fenced=3; }
+@@ -68,6 +77,14 @@
+ }
+ static void nq_publish(nq_receipt *r,uint64_t fence) { r->fence=fence; r->published=1; pthread_cond_broadcast(&nq_cv); }
+ static int nq_predicate(uint32_t current,unsigned mode,uint32_t target) { return mode==0 ? current==target : (uint32_t)(current-target)<0x80000000u; }
++// DM_NVN_SYNC_LAG=<k> (local; 0 = off, the default; 1 or 2): frames in flight. Ocarina of Time's main thread waits at the start of each frame, right after AcquireTexture,
++// on a sync of the frame it has just submitted, and signals the event its next commands wait on only when that wait returns (measured: blocked 11.6 ms of a 25 ms frame, the
++// replay standing still that long with nothing queued). So the CPU builds frame N only after the GPU has finished frame N-1. With k > 0 that one wait (the first on a queue
++// receipt after an acquire, nvnSyncWait) still waits until replay has reached the sync, but for the GPU only up to the present k frames before the newest queued one: at most k
++// frames are in flight, and the CPU's frame overlaps the GPU's. MacNativeGames' TOTK_SYNC_LAG is the same idea on its submit path.
++static uint64_t nq_pres_made;   // presents the game has queued (nvn_queue_present)
++static struct { uint64_t index, fence; } nq_pres_done[8];   // by index & 7: the newest Metal fence when replay ran that present
++int nvn_sync_lag(void) { static int v=-1; if(v<0) { const char *e=getenv("DM_NVN_SYNC_LAG"); v=e?atoi(e):0; if(v<0 || v>2) v=0; LOG("[nvn] frame-start sync wait: %s (DM_NVN_SYNC_LAG=%d)", v?"the GPU may be that many frames behind":"waits for all of the GPU's work, as the game asks", v); } return v; }
+ static int nq_sync_encoded(const sync_t *s,uint64_t *fence) {
+     if(s->fenced==3) { nq_receipt *r=(nq_receipt *)(uintptr_t)s->fence; if(!r->published) return 0; *fence=r->fence; return 1; }
+     if(!s->fenced) return 0; *fence=s->fence; return 1;
+@@ -77,17 +94,91 @@
+     while(*p) { nq_event_write *w=*p; if(w->fence<=done) { *p=w->next; free(w); } else p=&w->next; }
+     pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
+ }
++// Local (gap hunt 5, not for upstream): one frame's timeline between two openings of the gate the game signals from the CPU (nq_gh_release). Times in ns, all under nq_mu.
++// t0 the last opening; the game's submits since (first, last, count, command bytes, time waiting for g_sub_mu, time copying); its present; the replay's command nodes since
++// (time encoding, end of the last one)
++static struct { uint64_t t0, first_sub, last_sub, n_sub, sub_bytes, lock_ns, flat_ns, pres, enc_ns, enc_end; } nq_g5;
++// DM_NVN_PREENCODE=1 (local, not for upstream; off by default; needs the encode thread): encode behind the gate. Ocarina of Time submits a frame behind an event wait that only
++// its own CPU signal satisfies, and signals it when the GPU has finished the frame before (gap hunt 5: the whole next frame, 833-997 KB, sat queued about 12 ms with the replay
++// standing still, then took 13-14 ms to encode). With the switch, when nothing else is ready and a queue's head is such a wait (its word is one a CPU signal has released a parked
++// wait on before, nq_cpu_words) with nothing queued or in flight that writes the word, the replay goes on past it. Every Metal queue operation from there is kept by the encode
++// thread (nvn_rec.h, RO_HOLD) and reaches the GPU when the word satisfies the wait (a signal, or a plain store seen by the poll): the GPU starts nothing of that frame early.
++// One gate at a time
++void mtl_hold_begin(uint64_t id,uint64_t first_fence); void mtl_hold_release(uint64_t id); int mtl_hold_can(void); void mtl_hold_stats(uint64_t *forced,uint64_t *ops);
++void mtl_gspan_stats(uint64_t *v);   // local (gap hunt 6)
++static struct { volatile uint32_t *word; unsigned mode; uint32_t value; uint64_t id, t0; } nq_gate;   // the gate passed early and not open yet (id 0 = none); under nq_mu
++static uint64_t nq_gate_seq, nq_pre_n, nq_pre_ns;   // holds begun; gates opened after an early pass, and the time they were held
++static volatile uint32_t *nq_cpu_words[8]; static unsigned nq_cpu_words_n;
++// Local diagnostic (hitch study, not for upstream): counts for the red line of a hold ended by force (nvn_rec.h hold_force). Threads in SyncWait for a sync the replay has not
++// reached; in AcquireTexture for a present it has not reached; waiting for the submit lock; the replay's node (kind + 1, 0 = none), its queue and when it began
++static _Atomic uint64_t nq_hd_sync, nq_hd_pres, nq_hd_sub, nq_hd_kind, nq_hd_queue, nq_hd_t0;
++void mtl_hw_node_take(uint64_t *wait_ns,uint64_t *top_ns,const char **top_name); uint64_t mtl_hold_first_open(void);   // nvn_rec.h; for the "[stall]" lines: a replay node, a game SyncWait or a wait for the submit lock over 40 ms in play, 60 lines of each at most
++void nvn_queue_hold_diag(uint64_t v[6]) { v[0]=atomic_load(&nq_hd_sync); v[1]=atomic_load(&nq_hd_pres); v[2]=atomic_load(&nq_hd_sub); v[3]=atomic_load(&nq_hd_kind); v[4]=atomic_load(&nq_hd_queue); v[5]=now_ns()-atomic_load(&nq_hd_t0); }
++static int nq_pre_on(void) { static int v=-1; if(v<0) { const char *e=getenv("DM_NVN_PREENCODE"); v=e && atoi(e)>0 && mtl_hold_can(); LOG("[nvn] encode behind the gate: %s (DM_NVN_PREENCODE%s)", v?"on":"off", e && atoi(e)>0 && !v?"; it needs the encode thread, which is off":""); } return v; }
++static int nq_cpu_word(volatile uint32_t *word) { for(unsigned i=0;i<8;i++) if(nq_cpu_words[i]==word) return 1; return 0; }
++static void nq_cpu_word_learn(volatile uint32_t *word) { if(!nq_cpu_word(word)) nq_cpu_words[nq_cpu_words_n++&7]=word; }
++static uint64_t nq_gate_close(void) { uint64_t id=nq_gate.id; nq_pre_n++; nq_pre_ns+=now_ns()-nq_gate.t0; nq_gate.id=0; return id; }   // returns the hold to release, outside nq_mu
++// Local (gap hunt, not for upstream): why a parked event wait with no queued write known (class 0) was released. 5 a CPU signal; 6 a GPU completion's ADD signal; 7 a GPU
++// completion's WRITE signal that has a queued write entry by now; 4 a GPU completion's WRITE signal with no entry (never registered). The first 24 GPU releases in play are logged.
++static void nq_gh_release(nq_queue *q,nq_node *n,volatile uint32_t *word,unsigned mode,uint32_t value,uint64_t gpu_fence) {
++    nq_event_write *w=nq_event_write_of(word); n->park_class=!gpu_fence?5:mode==1?6:w?7:4;
++    if(!gpu_fence) {   // gap hunt 4: a CPU signal (this is the signalling thread): where in its frame it comes. The first 16 in play, then one line of means every 300
++        static int said4; static uint64_t n4, s_sw, s_blk, s_acq, s_took, s_park, s_any_sw, s_any_acq; uint64_t t=now_ns();
++        {   // gap hunt 5: where the frame's time went since the gate opened last, and what is queued at this opening. One line of means every 300 openings in play
++            static uint64_t k5, a[19], c_acq, c_sw; uint64_t p0=nq_g5.t0, oldest=0, newest=0; size_t all=0, same=0; unsigned jobs=0, queues=0;
++            for(nq_queue *x=nq_queues;x;x=x->next) { unsigned any=0;
++                for(nq_job *y=x->first;y;y=y->next) { size_t b=0; for(nq_node *z=y->first;z;z=z->next) if(z->kind==NQ_COMMANDS) b+=z->length;
++                    if(!b) continue;
++                    all+=b; if(x==q) same+=b; jobs++; any=1; if(!oldest || y->t_enq<oldest) oldest=y->t_enq; if(y->t_enq>newest) newest=y->t_enq; }
++                queues+=any; }
++            if(p0 && dm_nvn_frame_count()>900) {
++                uint64_t sw_begin=t_gh_sw_out-t_gh_sw_blocked;
++                a[0]+=nq_g5.first_sub>p0?nq_g5.first_sub-p0:0; a[1]+=nq_g5.last_sub>p0?nq_g5.last_sub-p0:0; a[2]+=nq_g5.n_sub; a[3]+=nq_g5.sub_bytes; a[4]+=nq_g5.lock_ns; a[5]+=nq_g5.flat_ns;
++                a[6]+=nq_g5.pres>p0?nq_g5.pres-p0:0;
++                if(t_gh_acq_out>p0) { a[7]+=t_gh_acq_out-p0; c_acq++; }
++                if(t_gh_sw_out>p0 && sw_begin>p0) { a[8]+=sw_begin-p0; a[9]+=t_gh_sw_out-p0; c_sw++; }
++                a[10]+=t-p0; a[11]+=nq_g5.enc_ns; a[12]+=nq_g5.enc_end>p0?nq_g5.enc_end-p0:0;
++                a[13]+=all; a[14]+=jobs; a[15]+=queues; a[16]+=same; a[17]+=oldest?t-oldest:0; a[18]+=newest?t-newest:0;
++                if(++k5%300==0) { double m=1e6*300, ka=c_acq?1e6*(double)c_acq:1, ks=c_sw?1e6*(double)c_sw:1;
++                    LOG("[gaphunt5] 300 gate openings to frame %llu, means. ms after the gate opened: the game's first submit %.3f, last submit %.3f (%.1f submits, %.1f KB of commands; they waited %.3f ms for the submit lock and took %.3f ms to copy), present queued %.3f, AcquireTexture returned %.3f (%llu of 300), the frame-start SyncWait began %.3f and returned %.3f (%llu of 300), the next gate opened %.3f | replay: encoding %.3f ms, its last command node ended %.3f ms after the gate opened | queued at the opening: %.1f KB of commands in %.1f jobs on %.1f queues (%.1f KB in the gate's own queue), the oldest submitted %.3f ms before, the newest %.3f ms before",
++                        (unsigned long long)dm_nvn_frame_count(),(double)a[0]/m,(double)a[1]/m,(double)a[2]/300,(double)a[3]/300/1024,(double)a[4]/m,(double)a[5]/m,(double)a[6]/m,
++                        (double)a[7]/ka,(unsigned long long)c_acq,(double)a[8]/ks,(double)a[9]/ks,(unsigned long long)c_sw,(double)a[10]/m,(double)a[11]/m,(double)a[12]/m,
++                        (double)a[13]/300/1024,(double)a[14]/300,(double)a[15]/300,(double)a[16]/300/1024,(double)a[17]/m,(double)a[18]/m);
++                    memset(a,0,sizeof a); c_acq=c_sw=0; }
++            }
++            memset(&nq_g5,0,sizeof nq_g5); nq_g5.t0=t;
++        }
++        char name[32]="?"; pthread_getname_np(pthread_self(),name,sizeof name);
++        double sw=t_gh_sw_out?(double)(t-t_gh_sw_out)/1e6:-1, acq=t_gh_acq_out?(double)(t-t_gh_acq_out)/1e6:-1, park=(double)(t-n->park_t0)/1e6;
++        uint64_t gs=atomic_load(&g_gh_sw_out), ga=atomic_load(&g_gh_acq_out);
++        if(dm_nvn_frame_count()<=900) return;
++        if(said4<16) { said4++; LOG("[gaphunt4] frame %llu queue %llu: wait (mode %u target %u) on word %p released by a CPU signal (mode %u value %u) from thread \"%s\"; that thread's last blocked SyncWait returned %.3f ms before (it had blocked %.3f ms), its last AcquireTexture returned %.3f ms before (that call took %.3f ms); any thread's last blocked SyncWait return %.3f ms before, last AcquireTexture return %.3f ms before; the wait was parked %.3f ms (-1 = never)",
++            (unsigned long long)dm_nvn_frame_count(),(unsigned long long)q->serial,n->mode,n->value,(void *)word,mode,value,name,sw,(double)t_gh_sw_blocked/1e6,acq,(double)t_gh_acq_took/1e6,gs?(double)(t-gs)/1e6:-1,ga?(double)(t-ga)/1e6:-1,park); }
++        n4++; s_sw+=t_gh_sw_out?t-t_gh_sw_out:0; s_blk+=t_gh_sw_blocked; s_acq+=t_gh_acq_out?t-t_gh_acq_out:0; s_took+=t_gh_acq_took; s_park+=t-n->park_t0; s_any_sw+=gs?t-gs:0; s_any_acq+=ga?t-ga:0;
++        if(n4%300==0) { double k=1e6*300; LOG("[gaphunt4] 300 CPU-signal releases to frame %llu, means in ms: since the signalling thread's last blocked SyncWait return %.3f (blocked %.3f), since its last AcquireTexture return %.3f (the call took %.3f); since any thread's SyncWait return %.3f, AcquireTexture return %.3f; parked %.3f",
++            (unsigned long long)dm_nvn_frame_count(),(double)s_sw/k,(double)s_blk/k,(double)s_acq/k,(double)s_took/k,(double)s_any_sw/k,(double)s_any_acq/k,(double)s_park/k); s_sw=s_blk=s_acq=s_took=s_park=s_any_sw=s_any_acq=0; }
++        return;
++    }
++    static int said; if(said>=24 || dm_nvn_frame_count()<=900) return;
++    said++; unsigned nqueues=0; for(nq_queue *p=nq_queues;p;p=p->next) nqueues++;
++    LOG("[gaphunt3] frame %llu queue %llu of %u: wait (mode %u target %u) on word %p released by a GPU signal (mode %u value %u, fence %llu); word now %u; queued write entry: %s fence %llu value %u exact %d; parked %.3f ms",
++        (unsigned long long)dm_nvn_frame_count(), (unsigned long long)q->serial, nqueues, n->mode, n->value, (void *)word, mode, value, (unsigned long long)gpu_fence,
++        atomic_load_explicit((_Atomic uint32_t *)word,memory_order_acquire), w?"yes":"none", (unsigned long long)(w?w->fence:0), w?w->value:0, w?w->exact:0, (double)(now_ns()-n->park_t0)/1e6);
++}
+ static void nq_event_publish(volatile uint32_t *word,unsigned mode,uint32_t value,uint64_t gpu_fence) {
+     pthread_mutex_lock(&nq_mu);
+     if(mode==1) atomic_fetch_add_explicit((_Atomic uint32_t *)word,value,memory_order_release);
+     else atomic_store_explicit((_Atomic uint32_t *)word,value,memory_order_release);
+     atomic_thread_fence(memory_order_seq_cst);
++    uint64_t rel=0;   // DM_NVN_PREENCODE: this signal opens the gate the replay passed early
++    if(nq_gate.id && nq_gate.word==word && nq_predicate(atomic_load_explicit((_Atomic uint32_t *)word,memory_order_acquire),nq_gate.mode,nq_gate.value)) rel=nq_gate_close();
+     // Latch waits already reached: a subsequent signal must not erase a release.
+     for(nq_queue *q=nq_queues;q;q=q->next) if(q->first && q->first->first) {
+         nq_node *n=q->first->first;
+-        if(n->kind==NQ_EVENT && n->waiting && n->event==word && (gpu_fence ? gpu_fence>=n->event_predecessor : nq_event_pending(word)<=mtl_completed_fence()) && nq_predicate(atomic_load_explicit((_Atomic uint32_t *)word,memory_order_acquire),n->mode,n->value)) { n->event=NULL; n->wait_fence=gpu_fence; }
++        if(n->kind==NQ_EVENT && n->waiting && n->event==word && (gpu_fence ? gpu_fence>=n->event_predecessor : nq_event_pending(word)<=mtl_completed_fence()) && nq_predicate(atomic_load_explicit((_Atomic uint32_t *)word,memory_order_acquire),n->mode,n->value)) { n->event=NULL; n->wait_fence=gpu_fence; if(!gpu_fence) nq_cpu_word_learn(word); if(n->park_t0 && !n->park_class) nq_gh_release(q,n,word,mode,value,gpu_fence); }   // local (gap hunt)
+     }
+     pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
++    if(rel) mtl_hold_release(rel);
+ }
+ void nvn_event_publish(volatile uint32_t *word,unsigned mode,uint32_t value) { nq_event_publish(word,mode,value,0); }
+ void nvn_event_publish_gpu(volatile uint32_t *word,unsigned mode,uint32_t value,uint64_t fence) { nq_event_publish(word,mode,value,fence); }
+@@ -107,16 +198,49 @@
+     atomic_fetch_add(&g_sub_instr,ins-c.instr); atomic_fetch_add(&g_cum_sub_instr,ins-c.instr);
+     atomic_fetch_add(&g_cum_sub_cyc,cyc-c.cycles); atomic_fetch_add(&g_cum_sub_sys_ns,thr_sys_ns()-c.sys);
+ }
++// Local (gap hunt, not for upstream): time the replay thread stays parked on a wait node, by cause, and the game's blocked nvnSyncWait time by sync kind (g_gh_sw_*, hle_nvn.c).
++// Park classes of a wait node: 0 event wait with no queued GPU write known for its word, released by the poll or a rescan; 1 event, the queued write is an ADD; 2 event, the queued
++// WRITE's value does not satisfy the wait; 3 sync whose fence is not replayed yet; 4 as 0 but released by a GPU completion (a signal of an in-flight submission the scheduler did
++// not know, nq_event_publish); 5 as 0 but released by a CPU signal (nvnEventSignal). Parked time is per node (nodes of several queues overlap); nq_gh_still_ns is the thread's own
++// stand-still time: [0] with an event wait at a queue head, [1] otherwise (nothing queued).
++static uint64_t nq_gh_ns[8], nq_gh_n[8], nq_gh_still_ns[2];   // classes 6 and 7: nq_gh_release
++static void nq_gh_park(nq_node *n,unsigned cause) { if(!n->park_t0) { n->park_t0=now_ns(); n->park_class=cause; } }
++static void nq_gh_report(uint64_t frame) {
++    static uint64_t last, t_last, pn[8], pns[8], pst[2], qn[4], qns[4]; if(!frame || frame%300 || frame==last) return;
++    uint64_t now=now_ns(); double nf=(double)(frame-last), wall=t_last?(double)(now-t_last)/1e6/nf:0, c[8], m[8], st[2], sc[4], sm[4]; last=frame; t_last=now;
++    for(int i=0;i<8;i++) { c[i]=(double)(nq_gh_n[i]-pn[i])/nf; m[i]=(double)(nq_gh_ns[i]-pns[i])/1e6/nf; pn[i]=nq_gh_n[i]; pns[i]=nq_gh_ns[i]; }
++    for(int i=0;i<2;i++) { st[i]=(double)(nq_gh_still_ns[i]-pst[i])/1e6/nf; pst[i]=nq_gh_still_ns[i]; }
++    for(int i=0;i<4;i++) { uint64_t sn=atomic_load(&g_gh_sw_n[i]), sns=atomic_load(&g_gh_sw_ns[i]); sc[i]=(double)(sn-qn[i])/nf; sm[i]=(double)(sns-qns[i])/1e6/nf; qn[i]=sn; qns[i]=sns; }
++    LOG("[gaphunt2] to frame %llu: %.0f frames, %.2f ms a frame | replay thread standing still, ms a frame: with an event wait at a queue head %.3f, otherwise %.3f | parked event waits by what released them (count / parked ms a frame): GPU completion of a WRITE signal never queued %.2f / %.3f, of an ADD signal %.2f / %.3f, of a queued WRITE signal %.2f / %.3f; CPU signal %.2f / %.3f; poll or rescan %.2f / %.3f; queued ADD %.2f / %.3f; queued WRITE not satisfying %.2f / %.3f; sync not replayed %.2f / %.3f | game blocked in SyncWait (count / ms a frame): fence value %.2f / %.3f; acquire sync %.2f / %.3f; queue receipt %.2f / %.3f",
++        (unsigned long long)frame, nf, wall, st[0], st[1], c[4], m[4], c[6], m[6], c[7], m[7], c[5], m[5], c[0], m[0], c[1], m[1], c[2], m[2], c[3], m[3], sc[1], sm[1], sc[2], sm[2], sc[3], sm[3]);
++    static uint64_t ln, lns; uint64_t la=atomic_load(&g_lag_n), lb=atomic_load(&g_lag_block_ns);   // DM_NVN_SYNC_LAG
++    if(la!=ln) LOG("[gaphunt2] to frame %llu: frame-start waits taken with DM_NVN_SYNC_LAG %.2f a frame, they still blocked %.3f ms a frame", (unsigned long long)frame, (double)(la-ln)/nf, (double)(lb-lns)/1e6/nf);
++    ln=la; lns=lb;
++    {   // gap hunt 6: the GPU's time inside the command buffers of a frame and its idle time between them (nvn_mtl.m gspan_note)
++        static uint64_t g0[6]; uint64_t g[6]; mtl_gspan_stats(g);
++        LOG("[gaphunt6] to frame %llu: %.1f GPU command buffers a frame, the GPU's time inside them %.3f ms a frame; GPU idle between two command buffers: %.3f ms a frame in %.1f gaps under 5 ms, %.3f ms a frame in %.2f longer gaps",
++            (unsigned long long)frame, (double)(g[0]-g0[0])/nf, (double)(g[1]-g0[1])/1e6/nf, (double)(g[3]-g0[3])/1e6/nf, (double)(g[2]-g0[2])/nf, (double)(g[5]-g0[5])/1e6/nf, (double)(g[4]-g0[4])/nf);
++        memcpy(g0,g,sizeof g0);
++    }
++    if(nq_pre_on()) {   // DM_NVN_PREENCODE
++        static uint64_t pn0, pns0, pf0, po0; uint64_t forced, ops; mtl_hold_stats(&forced,&ops);
++        LOG("[gaphunt2] to frame %llu: encode behind the gate: %.2f gates a frame passed early and opened later, the frame behind them held %.3f ms a frame; %.1f queue operations kept a frame; holds ended early %llu (%llu in all)",
++            (unsigned long long)frame, (double)(nq_pre_n-pn0)/nf, (double)(nq_pre_ns-pns0)/1e6/nf, (double)(ops-po0)/nf, (unsigned long long)(forced-pf0), (unsigned long long)forced);
++        pn0=nq_pre_n; pns0=nq_pre_ns; pf0=forced; po0=ops;
++    }
++}
+ static void *nq_worker(void *unused) {
+     (void)unused; pthread_setname_np("NVN queue replay");
+     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
+     uint64_t frame=UINT64_MAX;
+     for(;;) {
+-        pthread_mutex_lock(&nq_mu); nq_queue *q=NULL; nq_node *n=NULL; nq_job *j=NULL;
++        pthread_mutex_lock(&nq_mu); nq_queue *q=NULL; nq_node *n=NULL; nq_job *j=NULL; uint64_t pre_id=0;
+         for(;;) {
+         scan_again:;
+             if(nq_test_held) { pthread_cond_wait(&nq_cv,&nq_mu); continue; }
+-            int mapped_event_wait=0;
++            if(nq_gate.id && nq_predicate(atomic_load_explicit((_Atomic uint32_t *)nq_gate.word,memory_order_acquire),nq_gate.mode,nq_gate.value)) {   // DM_NVN_PREENCODE: opened by a plain store
++                uint64_t rel=nq_gate_close(); pthread_mutex_unlock(&nq_mu); mtl_hold_release(rel); pthread_mutex_lock(&nq_mu); goto scan_again; }
++            int mapped_event_wait=0; nq_queue *pre_q=NULL;
+             for(q=nq_queues;q;q=q->next) {
+                 j=q->first; if(!j) continue; n=j->first;
+                 if(!n) { nq_publish(j->receipt,q->physical); q->first=j->next; if(!q->first) q->last=NULL; nq_put(j->receipt);
+@@ -128,10 +252,12 @@
+                     // for the writer's completion left the GPU idle while the host encoded the next submission, 2 ms of its 14.5 ms frame, which its dynamic resolution read as work
+                     nq_event_write *queued=predecessor>mtl_completed_fence() ? nq_event_write_of(n->event) : NULL;
+                     if(queued && queued->exact && nq_predicate(queued->value,n->mode,n->value)) break;
+-                    if(predecessor>mtl_completed_fence() || !nq_predicate(atomic_load_explicit((_Atomic uint32_t *)n->event,memory_order_acquire),n->mode,n->value)) { n->waiting=1; mapped_event_wait=1; continue; }
++                    if(predecessor>mtl_completed_fence() || !nq_predicate(atomic_load_explicit((_Atomic uint32_t *)n->event,memory_order_acquire),n->mode,n->value)) {
++                        if(!pre_q && !queued && predecessor<=mtl_completed_fence() && n->next && nq_cpu_word(n->event)) pre_q=q;   // DM_NVN_PREENCODE: a gate only the game's CPU opens, with work behind it
++                        nq_gh_park(n,!queued?0:!queued->exact?1:2); n->waiting=1; mapped_event_wait=1; continue; }
+                 }
+                 if(n->kind==NQ_SYNC) {
+-                    if(n->receipt && !n->receipt->published) continue;
++                    if(n->receipt && !n->receipt->published) { nq_gh_park(n,3); continue; }
+                     // Targets are immutable snapshots. One Metal queue orders an encoded producer before this continuation. A sync not yet fenced when the wait was submitted
+                     // (wait_kind 0) is a snapshot of nothing to wait for, and the wait passes. Sparking! ZERO, on one NVN queue, waits on a sync before that queue's own first
+                     // fence of it at its first load, which runs on the console; parked here, the fence behind the wait never published and its SyncWait stalled the game (#1808)
+@@ -139,23 +265,31 @@
+                 break;
+             }
+             if(q) break;
++            if(pre_q && !nq_gate.id && nq_pre_on()) {   // DM_NVN_PREENCODE: nothing else is ready, so go on past the gate; what is encoded from here is kept until the game opens it
++                q=pre_q; j=q->first; n=j->first;
++                nq_gate.word=n->event; nq_gate.mode=n->mode; nq_gate.value=n->value; nq_gate.t0=now_ns(); nq_gate.id=pre_id=++nq_gate_seq; break; }
+             // NVN events can also be changed by plain stores through mapped pool memory.
+             // A bounded notification poll only while such a word is awaited complements API/callback wakes.
+-            if(mapped_event_wait) { struct timespec tick={0,1000000}; pthread_cond_timedwait_relative_np(&nq_cv,&nq_mu,&tick); }
++            uint64_t gh_w0=now_ns();   // local (gap hunt): the replay thread stands still here: with an event wait at a queue head (0), or with nothing ready for another reason (1)
++            if(mapped_event_wait || nq_gate.id) { struct timespec tick={0,1000000}; pthread_cond_timedwait_relative_np(&nq_cv,&nq_mu,&tick); }
+             else pthread_cond_wait(&nq_cv,&nq_mu);
++            nq_gh_still_ns[mapped_event_wait?0:1]+=now_ns()-gh_w0;
+         }
++        if(n->park_t0) { nq_gh_ns[n->park_class]+=now_ns()-n->park_t0; nq_gh_n[n->park_class]++; }
+         j->first=n->next; if(!j->first) j->last=NULL;
+         // Round-robin ready queues: a continually fed independent producer cannot starve another queue.
+         if(q->next) { nq_queue **link=&nq_queues; while(*link!=q) link=&(*link)->next; *link=q->next; nq_queue *tail=nq_queues; while(tail->next) tail=tail->next; tail->next=q; q->next=NULL; }
+         if(n->kind==NQ_SYNC || n->kind==NQ_EVENT) { uint64_t f=n->receipt?n->receipt->fence:n->wait_fence; if(f>q->physical) q->physical=f; }
+         if(n->kind==NQ_FENCE) nq_publish(n->receipt,q->physical);
+         pthread_mutex_unlock(&nq_mu);
+-        uint64_t fence=0, present=0;
++        atomic_store(&nq_hd_t0,now_ns()); atomic_store(&nq_hd_queue,q->serial); atomic_store(&nq_hd_kind,n->kind+1);   // local diagnostic (hitch study)
++        if(pre_id) { dm_host_mutex_lock(&g_sub_mu); mtl_hold_begin(pre_id,mtl_last_fence()+1); pthread_mutex_unlock(&g_sub_mu); }   // DM_NVN_PREENCODE: the hold starts here in the record stream
++        uint64_t fence=0, present=0, g5_e0=n->kind==NQ_COMMANDS?now_ns():0;   // g5_e0: local (gap hunt 5)
+         if(n->kind==NQ_COMMANDS || n->kind==NQ_PRESENT) {
+             dm_host_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush();
+             dm_host_work++; mtl_prepare(); dm_host_work--;
+             gfx_enter(); nq_cost cost=nq_cost_begin();
+-            if(frame!=j->frame) { frame=j->frame; mtl_set_frame(frame); }
++            if(frame!=j->frame) { frame=j->frame; mtl_set_frame(frame); nq_gh_report(frame); }
+             mtl_queue_activate(q->serial); mtl_set_queue_origin_lower_left(q->origin);
+             if(n->kind==NQ_COMMANDS) {
+                 uint64_t handle=(uintptr_t)n->bytes;
+@@ -168,7 +302,20 @@
+             }
+             nq_cost_end(cost); gfx_leave(); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu);
+         }
+-        pthread_mutex_lock(&nq_mu); if(n->kind==NQ_PRESENT) { q->present=present; j->receipt->present=present; } if(fence) { q->physical=fence; if(n->event) nq_event_issued(n->event,fence,n->mode,n->value); } if(n->receipt) nq_put(n->receipt); free(n->bytes); free(n); pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
++        atomic_store(&nq_hd_kind,0);   // local diagnostic (hitch study)
++        {   uint64_t w, top, dt=now_ns()-atomic_load(&nq_hd_t0), hf=mtl_hold_first_open(); const char *tn; mtl_hw_node_take(&w,&top,&tn);
++            static int said; static const char *const kind[5]={"commands","event wait","sync wait","fence","present"};
++            if(dt>40000000ull && said<60 && dm_nvn_frame_count()>900) { said++; LOG("[stall] frame %llu: the replay's node (%s, queue %llu) took %.1f ms, %.1f ms of it in listed waits (the longest: %s, %.1f ms); a hold is %s after it; submission fence %llu, present %llu",
++                (unsigned long long)dm_nvn_frame_count(),kind[n->kind<5?n->kind:0],(unsigned long long)q->serial,(double)dt/1e6,(double)w/1e6,tn,(double)top/1e6,hf?"open":"not open",(unsigned long long)fence,(unsigned long long)present); } }
++        pthread_mutex_lock(&nq_mu); if(g5_e0) { uint64_t e=now_ns(); nq_g5.enc_ns+=e-g5_e0; nq_g5.enc_end=e; }
++        if(n->kind==NQ_PRESENT) { q->present=present; j->receipt->present=present; nq_pres_done[n->pres_index&7].index=n->pres_index; nq_pres_done[n->pres_index&7].fence=mtl_last_fence(); } if(fence) { q->physical=fence;
++            // Every signal of the node is a queued write, not only its last one. Since signals stay in the segment a node holds several: Ocarina of Time signals 19 events a frame
++            // in a few nodes and waits on them from 6 queues. Only the last was registered, so a wait on any other found no queued write, fell to the memory value and parked until
++            // the GPU had completed the writer: 4 such waits a frame, the replay thread standing still 12.5-14.8 ms of a 27 ms frame while the GPU ran, then the GPU idle while it encoded.
++            // In order, so the last signal of a word is the one a waiter sees. DM_NVN_SIG_ALL=0: the last signal only, as before
++            if(nq_sig_all()) for(unsigned i=0;i<n->nsigs;i++) nq_event_issued(n->sigs[i].word,fence,n->sigs[i].mode,n->sigs[i].value);
++            else if(n->event) nq_event_issued(n->event,fence,n->mode,n->value); }
++        if(n->receipt) nq_put(n->receipt); free(n->sigs); free(n->bytes); free(n); pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
+     }
+     return NULL;
+ }
+@@ -194,7 +341,7 @@
+             // A signal stays in the segment: its value publishes at submission completion (mtl_sub_event's post op) and a
+             // waiter is ordered by that value, so a mid-segment fence buys nothing. Ending the segment here ended the open
+             // render pass at every signal: one pass per occlusion query, for an engine that signals per query.
+-            if(h.op==OP_SIGNAL_EVENT) { memcpy(&n->event,a,8); memcpy(&n->mode,a+8,4); memcpy(&n->value,a+12,4); }
++            if(h.op==OP_SIGNAL_EVENT) { memcpy(&n->event,a,8); memcpy(&n->mode,a+8,4); memcpy(&n->value,a+12,4); nq_sig_add(n); }
+         }
+         p+=h.size;
+     }
+@@ -204,12 +351,19 @@
+     pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue job allocation failed"); j->receipt=nq_new();
+     j->objects.klen=16; j->frame=dm_nvn_frame_count();
+     // No scheduler lock while copying descriptors or resolving shader libraries.
+-    dm_host_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush(); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost=nq_cost_begin();
++    uint64_t g5_a=now_ns();   // local (gap hunt 5): the wait for g_sub_mu (the replay holds it while it encodes a node), then the copy
++    atomic_fetch_add(&nq_hd_sub,1);   // local diagnostic (hitch study)
++    dm_host_mutex_lock(&g_sub_mu); atomic_fetch_sub(&nq_hd_sub,1); uint64_t g5_b=now_ns();
++    {   static _Atomic int said; if(g5_b-g5_a>40000000ull && dm_nvn_frame_count()>900 && atomic_fetch_add(&said,1)<60) { char name[32]="?"; pthread_getname_np(pthread_self(),name,sizeof name);
++            LOG("[stall] frame %llu: a submit on thread \"%s\" waited %.1f ms for the submit lock (the replay holds it while it encodes a node)", (unsigned long long)dm_nvn_frame_count(),name,(double)(g5_b-g5_a)/1e6); } } void *pool=objc_autoreleasePoolPush(); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost=nq_cost_begin();
+     for(int i=0;i<count;i++) nq_flatten(j,(const uint8_t *)(uintptr_t)handles[i],0); nq_end(j);
+     nq_cost_end(cost); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu);
+-    int waits=0; for(nq_node *node=j->first;node;node=node->next) waits|=node->kind==NQ_EVENT || node->kind==NQ_SYNC;
++    uint64_t g5_c=now_ns(); size_t g5_bytes=0;
++    int waits=0; for(nq_node *node=j->first;node;node=node->next) { waits|=node->kind==NQ_EVENT || node->kind==NQ_SYNC; if(node->kind==NQ_COMMANDS) g5_bytes+=node->length; }
+     nvn_cap_queue(q->serial,waits);
+     pthread_mutex_lock(&nq_mu);
++    j->t_enq=g5_c; if(!nq_g5.first_sub) nq_g5.first_sub=g5_c;
++    nq_g5.last_sub=g5_c; nq_g5.n_sub++; nq_g5.sub_bytes+=g5_bytes; nq_g5.lock_ns+=g5_b-g5_a; nq_g5.flat_ns+=g5_c-g5_b;
+     for(nq_node *node=j->first;node;node=node->next) if(node->sync_source) {
+         if(node->kind==NQ_FENCE) nq_set_sync((sync_t *)node->sync_source,node->receipt); else nq_snapshot_sync(node,node->sync_source);
+         node->sync_source=NULL;
+@@ -223,7 +377,7 @@
+     pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue present allocation failed");
+     j->receipt=nq_new(); j->frame=dm_nvn_frame_count(); nq_node *n=nq_append(j,NQ_PRESENT);
+     n->texture=*t; mtl_tex_pin(t->serial); n->period=period; if(crop) memcpy(n->crop,crop,sizeof n->crop);
+-    pthread_mutex_lock(&nq_mu); j->receipt->refs++; uint64_t ticket=(uintptr_t)j->receipt;
++    pthread_mutex_lock(&nq_mu); j->receipt->refs++; uint64_t ticket=(uintptr_t)j->receipt; n->pres_index=++nq_pres_made; nq_g5.pres=now_ns();
+     nq_enqueue(nq_get(q),j); pthread_mutex_unlock(&nq_mu); return ticket;
+ }
+ void nvn_queue_test_hold(int on) { pthread_mutex_lock(&nq_mu); nq_test_held=on; pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu); }
+@@ -232,7 +386,7 @@
+ }
+ void nvn_queue_present_wait(uint64_t ticket) {
+     if(!ticket) return; nq_receipt *r=(nq_receipt *)(uintptr_t)ticket;
+-    pthread_mutex_lock(&nq_mu); while(!r->published) pthread_cond_wait(&nq_cv,&nq_mu); uint64_t physical=r->present; pthread_mutex_unlock(&nq_mu);
++    pthread_mutex_lock(&nq_mu); atomic_fetch_add(&nq_hd_pres,1); while(!r->published) pthread_cond_wait(&nq_cv,&nq_mu); atomic_fetch_sub(&nq_hd_pres,1); uint64_t physical=r->present; pthread_mutex_unlock(&nq_mu);   // nq_hd_pres: local diagnostic (hitch study)
+     if(physical) mtl_present_wait(physical);
+ }
+ void nvn_queue_fence(queue_t *q,sync_t *s) {
+@@ -240,16 +394,31 @@
+     if(p->tail) nq_set_sync(s,p->tail); else { if(s->fenced==3) nq_put((nq_receipt *)(uintptr_t)s->fence); s->fenced=1; s->fence=p->physical; }
+     pthread_mutex_unlock(&nq_mu);
+ }
+-int nvn_sync_wait(const sync_t *s,uint64_t timeout) {
+-    uint64_t start=now_ns(),fence=0; pthread_mutex_lock(&nq_mu);
++// lag: 0, or DM_NVN_SYNC_LAG's frames in flight for the frame-start wait (above): the GPU is waited for only up to the present that many before the newest queued one
++int nvn_sync_wait_lag(const sync_t *s,uint64_t timeout,int lag) {
++    uint64_t start=now_ns(),fence=0; pthread_mutex_lock(&nq_mu); int hd=0;   // hd, nq_hd_sync: local diagnostic (hitch study)
+     while(!nq_sync_encoded(s,&fence)) {
+-        uint64_t elapsed=now_ns()-start; if(timeout!=UINT64_MAX && elapsed>=timeout) { pthread_mutex_unlock(&nq_mu); return 0; }
++        uint64_t elapsed=now_ns()-start; if(timeout!=UINT64_MAX && elapsed>=timeout) { if(hd) atomic_fetch_sub(&nq_hd_sync,1); pthread_mutex_unlock(&nq_mu); return 0; }
++        if(!hd) { hd=1; atomic_fetch_add(&nq_hd_sync,1); }
+         if(timeout==UINT64_MAX) pthread_cond_wait(&nq_cv,&nq_mu);
+         else { uint64_t left=timeout-elapsed; struct timespec ts={(time_t)(left/1000000000ull),(long)(left%1000000000ull)}; pthread_cond_timedwait_relative_np(&nq_cv,&nq_mu,&ts); }
+     }
++    if(hd) atomic_fetch_sub(&nq_hd_sync,1);
++    if(lag>0 && nq_pres_made>(uint64_t)lag) {   // a present replay has not reached yet has no entry: then the whole wait, as without the switch
++        uint64_t want=nq_pres_made-(uint64_t)lag;
++        if(nq_pres_done[want&7].index==want && nq_pres_done[want&7].fence<fence) fence=nq_pres_done[want&7].fence;
++    }
+     pthread_mutex_unlock(&nq_mu); uint64_t elapsed=now_ns()-start;
+-    return mtl_wait(fence,timeout==UINT64_MAX?timeout:elapsed>=timeout?0:timeout-elapsed);
++    uint64_t hf=mtl_hold_first_open();   // hf and the "[stall]" line: local diagnostic (hitch study)
++    int ok=mtl_wait(fence,timeout==UINT64_MAX?timeout:elapsed>=timeout?0:timeout-elapsed);
++    {   uint64_t total=now_ns()-start; static _Atomic int said;
++        if(total>40000000ull && dm_nvn_frame_count()>900 && atomic_fetch_add(&said,1)<60) { char name[32]="?"; pthread_getname_np(pthread_self(),name,sizeof name);
++            LOG("[stall] frame %llu: SyncWait on thread \"%s\" took %.1f ms: %.1f ms until the replay reached the sync, %.1f ms for the GPU (fence %llu; when the GPU wait began %s%s)%s",
++                (unsigned long long)dm_nvn_frame_count(),name,(double)total/1e6,(double)elapsed/1e6,(double)(total-elapsed)/1e6,(unsigned long long)fence,
++                !hf?"no hold was open":fence>=hf?"the fence was INSIDE the open hold":"a hold was open and the fence was before it","",ok?"":"; it timed out"); } }
++    return ok;
+ }
++int nvn_sync_wait(const sync_t *s,uint64_t timeout) { return nvn_sync_wait_lag(s,timeout,0); }
+ void nvn_queue_wait_sync(queue_t *q,const sync_t *s) {
+     nvn_cap_queue(q->serial,1);
+     pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue wait allocation failed"); j->receipt=nq_new();
+--- a/dm/gfx/nvn/nvn_rec.h
++++ b/dm/gfx/nvn/nvn_rec.h
+@@ -36,14 +36,17 @@
+     }
+     return NULL;
+ }
++static int on_sub_thread(void); static inline void hw_in(int site); static inline void hw_out(void);   // local diagnostic (hitch study), defined with the hold below
+ // Wait until the first seq ops are made
+ static void ubc_wait(uint64_t seq) {
+     if (atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= seq) return;
+-    uint64_t w0 = ws_t0();
++    uint64_t w0 = ws_t0(); int sub = on_sub_thread();   // sub, hw_in, hw_out: local diagnostic (hitch study; upstream 12a44e09 found the replay thread convoyed here on some builds)
++    if (sub) hw_in(WS_UBC);
+     while (atomic_load_explicit(&g_ubc_done, memory_order_acquire) < seq) {
+         if (atomic_load(&g_ubc_sleeping)) { pthread_mutex_lock(&g_ubc_mu); pthread_cond_signal(&g_ubc_cv); pthread_mutex_unlock(&g_ubc_mu); }
+         __builtin_arm_yield();
+     }
++    if (sub) hw_out();
+     if (ws_on()) ws_put(WS_UBC, w0, 1);
+ }
+ static inline uint64_t ubc_head(void) { return atomic_load_explicit(&g_ubc_head, memory_order_relaxed); }
+@@ -69,6 +72,7 @@
+     RO_T_ADDR, RO_T_TEX, RO_T_SAMP,
+     RO_LABEL, RO_R_TS, RO_C_TS,   // diagnostics: DM_NVN_ENC_LABEL, DM_NVN_GPUPROF
+     RO_NOTE,   // a[0] an _Atomic uint64_t, a[1] a value: the encode thread has made every call before this one (rec_note_wait)
++    RO_HOLD,   // a[0] a hold's number: queue operations after this record are kept until that hold is released (DM_NVN_PREENCODE, below)
+ };
+ typedef struct { uint32_t op, nobj; uint64_t a[15]; } rec_t;   // the first nobj slots hold retained objects (0 for nil), released once the call is made
+ enum { REC_BLK = 256 };
+@@ -102,6 +106,107 @@
+ static void rec_note_wait(_Atomic uint64_t *p, uint64_t v) {
+     if (atomic_load(p) >= v) return;
+     pthread_mutex_lock(&g_note_mu); while (atomic_load(p) < v) pthread_cond_wait(&g_note_cv, &g_note_mu); pthread_mutex_unlock(&g_note_mu);
++}
++// Set a note from any thread (a queue block): what the encode thread does at RO_NOTE
++static void rec_note_set(_Atomic uint64_t *p, uint64_t v) { pthread_mutex_lock(&g_note_mu); if (v > atomic_load(p)) atomic_store(p, v); pthread_cond_broadcast(&g_note_cv); pthread_mutex_unlock(&g_note_mu); }
++
++// ---------- Hold (DM_NVN_PREENCODE; local, not for upstream) ----------
++// Ocarina of Time submits a frame's commands behind a gate (an event wait) that it opens from the CPU only when the GPU has finished the frame before; the commands sat in the
++// queue about 12 ms with the replay standing still, then took 13-14 ms to encode (HANDOFF, gap hunt 5). With the switch the replay goes on past such a gate (nvn_queue.inc nq_gate)
++// and puts RO_HOLD in the record stream there. From that record on the encode thread makes every call as before, but keeps the queue operations (commits, event signals, queue
++// blocks) in a list, in order, and they reach the queue when the game opens the gate (mtl_hold_release, from any thread). So the GPU runs nothing of that frame early and reads
++// all game data in the game's order; only the host's own reads at replay come earlier. A hold ends early, with a red line, when the replay thread itself has to wait for held
++// work or uses the old queue, and after 100 ms (a watchdog): then the frame behind the gate starts on the GPU before the game opened it
++typedef struct { uint32_t op; uint64_t a[2]; } hold_op;   // a[0], a[1]: the operation's retained objects (RO_SIGNAL: a[1] is the value)
++static pthread_mutex_t g_hold_mu = PTHREAD_MUTEX_INITIALIZER;
++static hold_op *g_hold; static int g_nhold, g_caphold;
++static uint64_t g_hold_id, g_hold_released;   // under g_hold_mu: the hold the encode thread is in (0 = none); the newest hold released
++static _Atomic uint64_t g_hold_open, g_hold_first, g_hold_t0;   // the replay's side: the hold begun and not released (0 = none), the first fence in it, when it began
++static _Atomic uint64_t g_hold_forced, g_hold_ops;   // holds ended early; queue operations kept (statistics)
++static void hold_run(const hold_op *h) {   // one kept queue operation, as rec_exec makes it
++    if (h->op == RO_SIGNAL) [g_q4 signalEvent:rec_id(h->a[0]) value:h->a[1]];
++    else if (h->op == RO_Q_BLOCK) ((void (^)(void))rec_id(h->a[0]))();
++    else {
++        id<MTL4CommandBuffer> buffers[] = {rec_id(h->a[1])}; MTL4CommitOptions *o = rec_id(h->a[0]);
++        pthread_mutex_lock(&g_res_mu);
++        if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
++        pthread_mutex_unlock(&g_res_mu);
++    }
++    if (h->a[0]) CFRelease((CFTypeRef)(uintptr_t)h->a[0]);
++    if (h->op != RO_SIGNAL && h->a[1]) CFRelease((CFTypeRef)(uintptr_t)h->a[1]);
++}
++// The encode thread: keep a queue operation while a hold is on (1 = kept). With no hold the list is empty, so the caller's own call keeps the order
++static int hold_keep(uint32_t op, uint64_t a0, uint64_t a1) {
++    pthread_mutex_lock(&g_hold_mu);
++    if (!g_hold_id) { pthread_mutex_unlock(&g_hold_mu); return 0; }
++    if (g_nhold == g_caphold) { g_caphold = g_caphold ? g_caphold * 2 : 256; g_hold = realloc(g_hold, (size_t)g_caphold * sizeof *g_hold); if (!g_hold) MDIE("hold list: out of memory"); }
++    if (a0) CFRetain((CFTypeRef)(uintptr_t)a0);
++    if (op != RO_SIGNAL && a1) CFRetain((CFTypeRef)(uintptr_t)a1);
++    g_hold[g_nhold++] = (hold_op){op, {a0, a1}};
++    pthread_mutex_unlock(&g_hold_mu);
++    atomic_fetch_add(&g_hold_ops, 1);
++    return 1;
++}
++void mtl_hold_release(uint64_t id) {   // any thread: hold id and every one before it are over; what they kept reaches the queue now, in order
++    if (!id) return;
++    pthread_mutex_lock(&g_hold_mu);
++    if (id > g_hold_released) g_hold_released = id;
++    if (g_hold_id && g_hold_id <= g_hold_released) { @autoreleasepool { for (int i = 0; i < g_nhold; i++) hold_run(&g_hold[i]); } g_nhold = 0; g_hold_id = 0; }   // the caller may be a game thread with no pool
++    uint64_t open = atomic_load(&g_hold_open); if (open && open <= g_hold_released) atomic_store(&g_hold_open, 0);
++    pthread_mutex_unlock(&g_hold_mu);
++}
++// Local diagnostic (hitch study, not for upstream): who waits for what when a hold is ended by force. The replay thread's wait in progress (site and start, set at its wait
++// sites: hw_in / hw_out); every other thread's wait for the GPU in progress, by fence (g_hw_wait); the queue's own counts come from nvn_queue.inc (nvn_queue_hold_diag)
++static int on_sub_thread(void);
++static _Atomic int g_hw_site = -1; static _Atomic uint64_t g_hw_t0, g_hw_wait[16];
++static inline void hw_in(int site) { atomic_store(&g_hw_t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); atomic_store(&g_hw_site, site); }
++static _Atomic uint64_t g_hw_node_ns, g_hw_top_ns; static _Atomic int g_hw_top_site = -1;   // the replay thread's listed waits since mtl_hw_node_take: their sum, and the longest one
++static inline void hw_out(void) {
++    int site = atomic_exchange(&g_hw_site, -1); if (site < 0) return;
++    uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - atomic_load(&g_hw_t0);
++    atomic_fetch_add(&g_hw_node_ns, dt); if (dt > atomic_load(&g_hw_top_ns)) { atomic_store(&g_hw_top_ns, dt); atomic_store(&g_hw_top_site, site); }
++}
++// For the "[stall]" lines of nvn_queue.inc: the replay thread's listed waits since the last call (sum, the longest and its name), and the first fence of the open hold (0 = no hold)
++void mtl_hw_node_take(uint64_t *wait_ns, uint64_t *top_ns, const char **top_name) {
++    int s = atomic_exchange(&g_hw_top_site, -1); *wait_ns = atomic_exchange(&g_hw_node_ns, 0); *top_ns = atomic_exchange(&g_hw_top_ns, 0); *top_name = s < 0 ? "none" : ws_name[s];
++}
++uint64_t mtl_hold_first_open(void);
++static inline int hw_wait_in(uint64_t fence) { for (int i = 0; i < 16; i++) { uint64_t z = 0; if (atomic_compare_exchange_strong(&g_hw_wait[i], &z, fence)) return i; } return -1; }
++static inline void hw_wait_out(int i) { if (i >= 0) atomic_store(&g_hw_wait[i], 0); }
++void nvn_queue_hold_diag(uint64_t v[6]);   // threads in SyncWait for a sync the replay has not reached; in AcquireTexture for a present it has not reached; waiting for the submit lock; the replay's node: kind + 1 (0 = none), its queue, ns since it began
++static void hold_force(const char *why) {
++    uint64_t id = atomic_load(&g_hold_open); if (!id) return;
++    if (atomic_fetch_add(&g_hold_forced, 1) < 8) {
++        static const char *const kind[6] = {"none", "commands", "event wait", "sync wait", "fence", "present"};
++        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), first = atomic_load(&g_hold_first), v[6] = {0}, held = 0, other = 0, top = 0; nvn_queue_hold_diag(v);
++        for (int i = 0; i < 16; i++) { uint64_t f = atomic_load(&g_hw_wait[i]); if (!f) continue; if (f >= first) { held++; if (f > top) top = f; } else other++; }
++        int site = atomic_load(&g_hw_site);
++        MLOG("[RED] [pre-encode] hold %llu ended before the game opened its gate: %s | replay thread: %s%s%s for %.1f ms, in a node of kind %s on queue %llu begun %.1f ms before | other threads: %llu wait for the GPU on a fence inside the hold (newest %llu, the hold's first %llu), %llu on an older fence, %llu in SyncWait for a sync the replay has not reached, %llu in AcquireTexture for a present the replay has not reached, %llu wait for the submit lock",
++            (unsigned long long)id, why, site < 0 ? "in no listed wait" : "waits at \"", site < 0 ? "" : ws_name[site], site < 0 ? "" : "\"", site < 0 ? 0.0 : (double)(now - atomic_load(&g_hw_t0)) / 1e6,
++            kind[v[3] < 6 ? v[3] : 0], (unsigned long long)v[4], v[3] ? (double)v[5] / 1e6 : 0.0,
++            (unsigned long long)held, (unsigned long long)top, (unsigned long long)first, (unsigned long long)other, (unsigned long long)v[0], (unsigned long long)v[1], (unsigned long long)v[2]);
++    }
++    mtl_hold_release(id);
++}
++uint64_t mtl_hold_first_open(void) { return atomic_load(&g_hold_open) ? atomic_load(&g_hold_first) : 0; }   // local diagnostic (hitch study)
++static void *hold_watchdog(void *arg) {
++    (void)arg; pthread_setname_np("dm-hold-watch");
++    for (;;) { usleep(20000); uint64_t id = atomic_load(&g_hold_open), t0 = atomic_load(&g_hold_t0);
++        if (id && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0 > 100000000ull && atomic_load(&g_hold_open) == id) hold_force("held longer than 100 ms"); }
++    return NULL;
++}
++static inline int rec_on(void);
++static rec_t *rec_put(uint32_t op, uint32_t nobj);
++int mtl_hold_can(void) { return rec_on(); }   // holds live in the encode thread's record stream
++void mtl_hold_stats(uint64_t *forced, uint64_t *ops) { *forced = atomic_load(&g_hold_forced); *ops = atomic_load(&g_hold_ops); }
++// The replay thread, between two submissions, under g_sub_mu: everything recorded from here belongs to hold id; first_fence is the first submission in it
++void mtl_hold_begin(uint64_t id, uint64_t first_fence) {
++    if (!rec_on() || !id) return;
++    static int watch; if (!watch) { watch = 1; pthread_t th; if (!pthread_create(&th, NULL, hold_watchdog, NULL)) pthread_detach(th); }
++    rec_put(RO_HOLD, 0)->a[0] = id;
++    pthread_mutex_lock(&g_hold_mu);
++    if (g_hold_released < id) { atomic_store(&g_hold_first, first_fence); atomic_store(&g_hold_t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); atomic_store(&g_hold_open, id); }
++    pthread_mutex_unlock(&g_hold_mu);
+ }
+ 
+ // ---------- The encode thread ----------
+@@ -116,13 +221,16 @@
+     case RO_COMMIT: case RO_COMMIT_REAL: {
+         if (r->op == RO_COMMIT) ubc_wait(a[2]);   // the uniform shadows this command buffer reads
+         id<MTL4CommandBuffer> buffers[] = {r->op == RO_COMMIT ? g_rx_cb : rec_id(a[1])}; MTL4CommitOptions *o = rec_id(a[0]);
+-        pthread_mutex_lock(&g_res_mu);
+-        if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
+-        pthread_mutex_unlock(&g_res_mu);
++        if (!hold_keep(r->op, a[0], (uint64_t)(uintptr_t)(__bridge void *)buffers[0])) {   // DM_NVN_PREENCODE: kept while a hold is on
++            pthread_mutex_lock(&g_res_mu);
++            if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
++            pthread_mutex_unlock(&g_res_mu);
++        }
+         if (r->op == RO_COMMIT) g_rx_cb = nil;
+         break; }
+-    case RO_SIGNAL: [g_q4 signalEvent:rec_id(a[0]) value:a[1]]; break;
+-    case RO_Q_BLOCK: ((void (^)(void))rec_id(a[0]))(); break;
++    case RO_SIGNAL: if (!hold_keep(RO_SIGNAL, a[0], a[1])) [g_q4 signalEvent:rec_id(a[0]) value:a[1]]; break;
++    case RO_Q_BLOCK: if (!hold_keep(RO_Q_BLOCK, a[0], 0)) ((void (^)(void))rec_id(a[0]))(); break;
++    case RO_HOLD: pthread_mutex_lock(&g_hold_mu); if (g_hold_released < a[0]) g_hold_id = a[0]; pthread_mutex_unlock(&g_hold_mu); break;
+     case RO_RE_BEGIN: g_rx_enc = [(id<MTL4CommandBuffer>)g_rx_cb renderCommandEncoderWithDescriptor:rec_id(a[0])]; break;
+     case RO_CE_BEGIN: g_rx_enc = [(id<MTL4CommandBuffer>)g_rx_cb computeCommandEncoder]; break;
+     case RO_END: [(id<MTL4CommandEncoder>)e endEncoding]; g_rx_enc = nil; break;
+@@ -175,7 +283,7 @@
+     case RO_LABEL: [(id<MTL4CommandEncoder>)e setLabel:rec_id(a[0])]; break;
+     case RO_R_TS: [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:a[1] afterStage:a[2] intoHeap:rec_id(a[0]) atIndex:a[3]]; break;
+     case RO_C_TS: [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:a[1] intoHeap:rec_id(a[0]) atIndex:a[2]]; break;
+-    case RO_NOTE: { _Atomic uint64_t *p = (_Atomic uint64_t *)(uintptr_t)a[0]; pthread_mutex_lock(&g_note_mu); if (a[1] > atomic_load(p)) atomic_store(p, a[1]); pthread_cond_broadcast(&g_note_cv); pthread_mutex_unlock(&g_note_mu); break; }
++    case RO_NOTE: rec_note_set((_Atomic uint64_t *)(uintptr_t)a[0], a[1]); break;
+     default: MDIE("deferred encoding: unknown record %u", r->op);
+     }
+     for (uint32_t i = 0; i < r->nobj; i++) if (a[i]) CFRelease((CFTypeRef)(uintptr_t)a[i]);
+@@ -222,10 +330,12 @@
+ static void rec_drain(void) {
+     if (!g_rb_started) return;
+     rec_publish();
+-    uint64_t w0 = ws_t0(); int blocked = 0;
++    uint64_t w0 = ws_t0(); int blocked = 0, sub = on_sub_thread();   // sub, hw_in, hw_out: local diagnostic (hitch study)
++    if (sub) hw_in(WS_DRAIN);
+     pthread_mutex_lock(&g_rb_mu);
+     while (g_rb_head || g_rb_busy) { blocked = 1; pthread_cond_wait(&g_rb_idle, &g_rb_mu); }
+     pthread_mutex_unlock(&g_rb_mu);
++    if (sub) hw_out();
+     if (ws_on()) ws_put(WS_DRAIN, w0, blocked);
+ }
+ // A block of records from another thread than the submit thread (the present snapshot's copy): it goes in one piece behind every block published so far. Everything the game
+--- a/dm/host/front_mac.m
++++ b/dm/host/front_mac.m
+@@ -629,11 +629,18 @@
+ - (void)mouseUp:(NSEvent *)e { (void)e; if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); } }
+ // The drawable follows the view in pixels: a layer assigned to a layer-backed view kept the drawable at the first window's 1280x720 in fullscreen too, so the game picture was
+ // scaled down to it and up again by the compositor
++// DM_OUTPUT_HEIGHT=<n> (the settings window's Fullscreen resolution): in fullscreen the drawable is no larger than the size at which the game's 16:9 picture is n pixels
++// high (1440: 2560x1440, 1080: 1920x1080 inside it), and the compositor scales it to the screen; 0 or unset keeps the screen's own pixels. A window keeps its own pixels
+ - (void)fitDrawable {
+     CAMetalLayer *l = (CAMetalLayer *)self.layer; if (![l isKindOfClass:CAMetalLayer.class] || !self.window) return;
+     l.contentsScale = self.window.backingScaleFactor;
+-    NSSize px = [self convertSizeToBacking:self.bounds.size]; if (px.width < 1 || px.height < 1 || CGSizeEqualToSize(l.drawableSize, px)) return;
+-    l.drawableSize = px; LOG("front end: drawable %.0fx%.0f", px.width, px.height);
++    NSSize px = [self convertSizeToBacking:self.bounds.size]; if (px.width < 1 || px.height < 1) return;
++    static int cap = -1; if (cap < 0) { const char *e = getenv("DM_OUTPUT_HEIGHT"); cap = e ? atoi(e) : 0; if (cap < 0) cap = 0; }
++    double picture = fmin(px.height, px.width * 9 / 16);   // the height of the 16:9 picture inside the view
++    int capped = cap && (self.window.styleMask & NSWindowStyleMaskFullScreen) && picture > cap;
++    if (capped) px = NSMakeSize(round(px.width * cap / picture), round(px.height * cap / picture));
++    if (CGSizeEqualToSize(l.drawableSize, px)) return;
++    l.drawableSize = px; LOG("front end: drawable %.0fx%.0f%s", px.width, px.height, capped ? " (DM_OUTPUT_HEIGHT)" : "");
+ }
+ - (void)setFrameSize:(NSSize)s { [super setFrameSize:s]; [self fitDrawable]; }
+ - (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self fitDrawable]; }
+@@ -1607,8 +1614,8 @@
+         [nc addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); }];
+         // Entering and leaving fullscreen: the layer is layer-backed, so its frame (and with it the drawable) follows the
+         // content view by itself; only the scale factor has to be carried over to the screen the window ended up on. The screen's rate is matched in fullscreen only (screen_match_apply)
+-        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); g_fullscreen = 1; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
+-        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 0; screen_refresh(win.screen); g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
++        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); g_fullscreen = 1; g_layer.contentsScale = win.backingScaleFactor; [(DmGameView *)win.contentView fitDrawable]; screen_match_apply(); }];
++        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 0; screen_refresh(win.screen); g_layer.contentsScale = win.backingScaleFactor; [(DmGameView *)win.contentView fitDrawable]; screen_match_apply(); }];
+         // DM_FOCUS_KEEP=1 (scripts/regress.py): the game stays in focus while its window is up, whichever app is active. Tears of the Kingdom stops presenting out of focus, so
+         // another app taking the key window during an unattended run read as a hang (no frame after the last focus change)
+         static int keep = -1; if (keep < 0) keep = getenv("DM_FOCUS_KEEP") && atoi(getenv("DM_FOCUS_KEEP"));

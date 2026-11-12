@@ -1,0 +1,183 @@
+diff --git a/dm/games/0400486024DEC000/game.tsv b/dm/games/0400486024DEC000/game.tsv
+--- a/dm/games/0400486024DEC000/game.tsv
++++ b/dm/games/0400486024DEC000/game.tsv
+@@ -52,3 +52,6 @@
+ # As Tears of the Kingdom: the terrain's height, blend and hole maps are written by the CPU into textures after they are created. Without these keys they stay zero: holes in the ground and the wrong materials
+ tex_flush_upload	on
+ tex_dirty_upload	on
++# The game's compute dispatches with no barrier of its between them run side by side (nvn_mtl.m dispatch_enc): on the kokiri-deck route GPU p50 15.63 -> 14.76 ms (docked,
++# Apple M4 Pro, three runs a side), the pictures alike
++dispatch_overlap	on
+diff --git a/dm/games/game.py b/dm/games/game.py
+--- a/dm/games/game.py
++++ b/dm/games/game.py
+@@ -193,6 +193,8 @@
+     sko, skl = (int(m[1], 0), int(m[2], 0)) if m else (0, 0)
+     rcd = g.get('render_cond', 'off')   # NVN conditional rendering evaluated at replay, timestamp reports with counter 0 (nvn_mtl.m OP_RENDER_COND): on / off
+     if rcd not in ('on', 'off'): sys.exit(f'{g.id}: render_cond must be on or off: {rcd}')
++    dov = g.get('dispatch_overlap', 'off')   # the game's dispatches with no barrier of its between them run side by side in the copy encoder (nvn_mtl.m dispatch_enc; DM_NVN_DISPATCH_OVERLAP overrides): on / off
++    if dov not in ('on', 'off'): sys.exit(f'{g.id}: dispatch_overlap must be on or off: {dov}')
+     tfu = g.get('tex_flush_upload', 'off')   # textures written by the CPU into a pool and published with nvnMemoryPoolFlushMappedRange are uploaded like packaged ones (hle_nvn.c): on / off
+     if tfu not in ('on', 'off'): sys.exit(f'{g.id}: tex_flush_upload must be on or off: {tfu}')
+     tdu = g.get('tex_dirty_upload', 'off')   # with tex_flush_upload: a registered texture the CPU writes after init without any flush is uploaded too (dirty pages, hle_nvn.c nvn_ft_written): on / off
+@@ -259,6 +261,7 @@
+          f'#define DM_GAME_TEX_FLUSH_UPLOAD {int(tfu == "on")}',
+          f'#define DM_GAME_SHADER_KEY_SKIP_OFF {sko:#x}', f'#define DM_GAME_SHADER_KEY_SKIP_LEN {skl:#x}',
+          f'#define DM_GAME_RENDER_COND {int(rcd == "on")}',
++         f'#define DM_GAME_DISPATCH_OVERLAP {int(dov == "on")}',
+          f'#define DM_GAME_TEX_DIRTY_UPLOAD {int(tdu == "on")}',
+          f'#define DM_GAME_TEX_DYN_SLOTS {int(tds == "on")}',
+          f'#define DM_GAME_GPU_TS_SEGMENT {int(gts == "segment")}',
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -1624,6 +1624,8 @@
+ // allocator gave out overlapping blocks, see hle_nvn.c zcull_size; NVN runs copies in order for any game)
+ enum { BW_MAX = 64 };
+ static uint64_t g_bw_lo[BW_MAX], g_bw_hi[BW_MAX], g_br_lo[BW_MAX], g_br_hi[BW_MAX]; static int g_bw_n, g_br_n, g_blit_ops; static uint64_t g_blit_barriers;
++static int g_blit_disponly = 1;   // since the copy encoder's last barrier only the game's dispatches went into it (dispatch_enc)
++static int g_cs_gbar;             // the game called nvnCommandBufferBarrier since its last dispatch (dispatch_enc)
+ static uint64_t g_blit_splits;   // copies / buffer updates / fills that ended an open draw pass (the residency set line; a pass ended this way stores and the next one reloads its attachments)
+ uint64_t mtl_blit_splits(void) { return g_blit_splits; }
+ static int enc_open(void);
+@@ -1643,7 +1645,7 @@
+     static int off = -1; if (off < 0) { const char *e = getenv("DM_NVN_BLIT_ORDER"); off = e && !strcmp(e, "0"); if (off) MLOG("DM_NVN_BLIT_ORDER=0: no barriers inside the copy encoder (diagnostic; brings back the fountain's vertical stripes)"); }
+     // Only the stages a compute encoder has: MTLStageAll here fails Metal validation (macOS 27: "must be a valid combination of MTLStages for the current encoder type")
+     if (!off) [g_blit barrierAfterEncoderStages:MTLStageDispatch | MTLStageBlit beforeEncoderStages:MTLStageDispatch | MTLStageBlit visibilityOptions:blit_vis()];
+-    g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_barriers++;
++    g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_barriers++; g_blit_disponly = 1;
+ }
+ uint64_t mtl_blit_barriers(void) { return g_blit_barriers; }
+ static int bw_hit(uint64_t lo, uint64_t hi) { for (int i = 0; i < g_bw_n; i++) if (lo < g_bw_hi[i] && g_bw_lo[i] < hi) return 1; return 0; }
+@@ -1682,7 +1684,7 @@
+     // range-based batching, including separate Metal buffers over one CPU range.
+     if (nvn_sparse_alias(rlo, rhi) || nvn_sparse_alias(wlo, whi)) { wlo = 0; whi = ~0ull; }
+     if (g_blit_ops && (g_bw_n == BW_MAX || g_br_n == BW_MAX || (rhi > rlo && bw_hit(rlo, rhi)) || bw_hit(wlo, whi) || br_hit(wlo, whi))) blit_barrier();
+-    g_bw_lo[g_bw_n] = wlo; g_bw_hi[g_bw_n++] = whi; g_blit_ops++; g_gp_copies++;
++    g_bw_lo[g_bw_n] = wlo; g_bw_hi[g_bw_n++] = whi; g_blit_ops++; g_gp_copies++; g_blit_disponly = 0;
+     if (rhi > rlo) { g_br_lo[g_br_n] = rlo; g_br_hi[g_br_n++] = rhi; }
+     return e;
+ }
+@@ -1690,7 +1692,7 @@
+ static id<MTL4ComputeCommandEncoder> blit(void) {
+     id<MTL4ComputeCommandEncoder> e = blit_raw();
+     if (g_blit_ops) blit_barrier();
+-    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // record as "everything written": the next operation always gets a barrier
++    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1; g_blit_disponly = 0;   // record as "everything written": the next operation always gets a barrier
+     return e;
+ }
+ 
+@@ -13528,10 +13530,18 @@
+     if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_OWN"); v = (e && !strcmp(e, "1")) || pg_on(); if (v) MLOG("compute dispatches: each in an encoder of its own (DM_NVN_DISPATCH_OWN=1 or DM_NVN_PASSGPU)"); }
+     return v;
+ }
+-static id<MTL4ComputeCommandEncoder> dispatch_enc(void) {
++// DM_NVN_DISPATCH_OVERLAP (profile key dispatch_overlap): two of the game's dispatches with nothing between them in the copy encoder and no nvnCommandBufferBarrier of the game's
++// between them run side by side, as NVN lets them: it orders a dispatch after earlier work only through a barrier. A copy, fill or inline update between them, a host dispatch
++// (dispatch_enc's game 0) or a game barrier keeps the barrier, and what comes after a dispatch other than a dispatch still waits for it (everything written). See docs/reference/rendering.md,
++// "Compute dispatches ordered by the game's own barriers" (Ocarina of Time)
++static uint64_t g_disp_beside; static int g_disp_last_beside;   // dispatches placed beside the one before (t_dispatch_overlap); whether the last one was
++static int dispatch_overlap(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_OVERLAP"); v = e ? atoi(e) != 0 : DM_GAME_DISPATCH_OVERLAP; if (v) MLOG("dispatch overlap: the game's dispatches with no barrier of its between them run side by side (DM_NVN_DISPATCH_OVERLAP=0 orders each after the one before)"); } return v; }
++static id<MTL4ComputeCommandEncoder> dispatch_enc(int game) {   // game: one of the game's dispatches (0: the host's own, ordered as a copy is)
+     id<MTL4ComputeCommandEncoder> e = blit_open(); g_gp_disp++;
+-    if (g_blit_ops) blit_barrier();
+-    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // recorded as "everything written": the next copy or dispatch gets a barrier
++    int beside = game && g_blit_ops && g_blit_disponly && !g_cs_gbar && dispatch_overlap();
++    if (g_blit_ops && !beside) blit_barrier();
++    if (game) { g_disp_last_beside = beside; if (beside) g_disp_beside++; g_cs_gbar = 0; }
++    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1; g_blit_disponly = game;   // recorded as "everything written": the next copy, or a dispatch after a game barrier, gets a barrier
+     if (!g_blit_ct) { [e setArgumentTable:g_ct]; g_blit_ct = 1; }
+     args_dirty_all();
+     return e;
+@@ -13604,7 +13614,8 @@
+     // or before dispatch_enc's copy-to-dispatch barrier: otherwise the upgrade opens a second encoder, or its copy races the dispatch (#1743).
+     encode_args(nil, cs, 5, 0);
+     if (own && g_blit) { enc_b_end(g_blit); g_blit = nil; }
+-    id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc();
++    id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc(1);
++    PD("X %llu dispatch %s groups %llux%llux%llu%s%s", g_stat_pass, cs->key, (unsigned long long)dp->x, (unsigned long long)dp->y, (unsigned long long)dp->z, dp->ind ? " indirect" : "", own ? " (own encoder)" : g_disp_last_beside ? " beside the one before" : " after a barrier");
+     enc_c_pso(ce, ps);
+     if (tg_groups) {
+         __strong id<MTLBuffer> tb = nil; size_t to = arena_alloc((size_t)(tg_groups * cs->rf.tg_spill), &tb);
+@@ -13641,7 +13652,7 @@
+     id<MTLBuffer> pb; size_t po = arena_alloc(48, &pb);
+     struct { uint64_t s, d; uint32_t w, h, row, img, drow, dimg, shift; } *p = (void *)((uint8_t *)pb.contents + po);
+     *p = (typeof(*p)){src, dst, (uint32_t)(wb / 2), (uint32_t)rows, (uint32_t)row, (uint32_t)img, (uint32_t)drow, (uint32_t)dimg, (uint32_t)shift};
+-    id<MTL4ComputeCommandEncoder> e = dispatch_enc();
++    id<MTL4ComputeCommandEncoder> e = dispatch_enc(0);
+     [g_ct setAddress:pb.gpuAddress + po atIndex:0]; enc_c_pso(e, ps);
+     enc_c_dispatch(e, MTLSizeMake((wb / 2 + 63) / 64, rows, nz), MTLSizeMake(64, 1, 1));
+     static int once; if (!once++) MLOG("RGB565-family copy between guest memory and a host texture: red and blue exchanged on the GPU (first case %zux%zux%zu texels)", wb / 2, rows, nz);
+@@ -14720,7 +14731,7 @@
+                 PD("I %llu barrier bits %#x%s", g_stat_pass, bits, split ? ": ends the pass (shader writes)" : order ? " (render pass open; a later shader write is ordered after its draws)" : g_enc ? " (render pass open)" : "");
+                 if (split) { rp_end(); static int once; if (!once++) MLOG("a game barrier (bits %#x) after shader writes in a draw pass: the pass ends there (first case pass %llu)", bits, (unsigned long long)g_stat_pass); }
+                 else if (order) g_pass_order |= (bits & NVN_BARRIER_ORDER_PRIMITIVES_BIT ? 1 : 0) | (bits & (NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT) ? 2 : 0);
+-                if (bits) { g_game_barrier |= bits; g_fb_bar++; } break; }   // g_fb_bar: snapshots taken before it are stale (see fb_prepare)
++                if (bits) { g_game_barrier |= bits; g_fb_bar++; g_cs_gbar = 1; } break; }   // g_fb_bar: snapshots taken before it are stale (see fb_prepare); g_cs_gbar: dispatch_enc
+             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: state_op(h.op, a); break;
+             default: break;
+         }
+diff --git a/dm/gfx/tests/Makefile b/dm/gfx/tests/Makefile
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -121,6 +121,10 @@
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_link_ticks.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+ t_cpu_tex: t_cpu_tex.m $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_cpu_tex.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
++# The game's dispatches side by side in the copy encoder where no barrier of its and nothing else lies between them (dispatch_enc, DM_NVN_DISPATCH_OVERLAP)
++t_dispatch_overlap: t_dispatch_overlap.m $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_overlap.m $(MTL_T_SRC) $(FW)
++check_t_dispatch_overlap: RUN_ENV = MTL_DEBUG_LAYER=1
+ .PHONY: check_t_cpu_tex
+ check_t_cpu_tex: t_cpu_tex
+ 	MTL_DEBUG_LAYER=1 ./t_cpu_tex --metal
+diff --git a/dm/gfx/tests/t_dispatch_overlap.m b/dm/gfx/tests/t_dispatch_overlap.m
+new file mode 100644
+--- /dev/null
++++ b/dm/gfx/tests/t_dispatch_overlap.m
+@@ -0,0 +1,34 @@
++// The game's dispatches in the copy encoder (dispatch_enc, DM_NVN_DISPATCH_OVERLAP): two with nothing between them and no barrier of the game's run side by side; a game barrier,
++// a copy between them or a host dispatch keeps the barrier (counted by the copy encoder's barriers, g_blit_barriers)
++#import <Foundation/Foundation.h>
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++
++static int checks, failed;
++#define CHECK(c, label) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (line %d)\n", label, __LINE__); } } while (0)
++
++int main(void) { @autoreleasepool {
++    setenv("DM_NVN_DISPATCH_OVERLAP", "1", 1);
++    mtl_init();
++    mtl_sub_begin();
++    uint64_t b0 = g_blit_barriers;
++    dispatch_enc(1);
++    CHECK(g_blit_barriers == b0, "the first dispatch in the encoder needs no barrier");
++    dispatch_enc(1); dispatch_enc(1);
++    CHECK(g_blit_barriers == b0 && g_disp_beside == 2, "dispatches with nothing between them run side by side");
++    g_cs_gbar = 1; dispatch_enc(1);
++    CHECK(g_blit_barriers == b0 + 1 && !g_cs_gbar, "a game barrier between them keeps the barrier");
++    blit_buf(0, 0, 0x1000, 0x2000); dispatch_enc(1);
++    CHECK(g_blit_barriers == b0 + 3, "a copy after a dispatch waits for it, and the dispatch after the copy waits for the copy");
++    uint64_t b1 = g_blit_barriers; dispatch_enc(0);
++    CHECK(g_blit_barriers == b1 + 1, "a host dispatch is ordered as a copy is");
++    uint64_t b2 = g_blit_barriers; dispatch_enc(1);
++    CHECK(g_blit_barriers == b2 + 1, "a game dispatch after a host dispatch waits for it");
++    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "the submission completes");
++    printf("t_dispatch_overlap: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++} }
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -137,6 +137,7 @@
+ DM_NVN_DEPTHOVR	diagnostic	`=<fragment shader key prefix>,…`: those draws compare depth with `ALWAYS`; with `DM_NVN_HILITE`, tells "the depth test rejects every fragment" from "nothing rasterizes"
+ DM_NVN_DIRECT_UPLOAD	switch	0 disables bounded direct RGBA16F array uploads and keeps staged copies; on by default for supported non-sparse textures.
+ DM_NVN_DIRTYCHECK	diagnostic	`=1` fully hashes pool content on every use to find changes the dirty-page tracking missed
++DM_NVN_DISPATCH_OVERLAP	switch	`1` runs the game's compute dispatches with no barrier of its and nothing else between them side by side in the copy encoder, as NVN allows; `0` orders each after the one before (the default unless the profile sets dispatch_overlap: Ocarina of Time does)
+ DM_NVN_DISPATCH_OWN	switch	`=1` gives every compute dispatch a compute encoder of its own with full barriers, as before (by default dispatches share the copy encoder); `DM_NVN_PASSGPU` does the same
+ DM_NVN_DUAL_WANT	path	`=<file>`: appends the key of each pixel shader a pipeline blends with its output 1 as the second source, while it has no dual-source entry point, to that file, once per key (the profile's `dual_want.tsv`)
+ DM_NVN_ENC_LABEL	diagnostic	`=1` labels every render encoder `p<pass in frame> <width>x<height> <first 8 digits of the first draw's fragment key> d<draws>` for Instruments traces
