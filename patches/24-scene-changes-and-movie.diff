@@ -1,0 +1,487 @@
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -1599,11 +1599,14 @@
+ // as usual. Printed as "[gpuprof]" lines once the frame's last command buffer completes: one per encoder, then a frame line with the render and compute / copy time, the attachment
+ // traffic and the span from the first start to the last end. dm/tools/gpuprof.py sums them by pass shape.
+ // DM_NVN_GPUPROF=every:<n> profiles one frame in every n (frames that are multiples of n), each reported on its own: for a device run whose scene cannot be timed to a frame number.
++// DM_NVN_GPUPROF=slow:<ms> profiles frames as every:1 does (a frame whose report is pending skips the next) and prints a frame only when one encoder, or its first start to last
++// end, took at least <ms>: the rare GPU spikes (local, 2026-11-12: single passes of 40-170 ms at scene changes that every:600 never samples)
+ // A render pass line also gives what it loaded and stored of its attachments (KB, the bandwidth ledger's view: DontCare stores are not counted) and the Metal pixel formats of
+ // colour attachment 0 and of the depth / stencil attachment (0: none)
+ enum { GP_MAX = 4096 };   // the largest timestamp heap Metal makes
+ typedef struct { char kind; uint16_t w, h; uint8_t nc, depth, loads; uint32_t draws, seg; uint64_t pass; uint32_t ld_kb, st_kb; uint16_t cfmt, dfmt; uint64_t cpu0, cpu1; } gp_lab;   // seg: the command buffer (segment) of the submission it is in
+ static id<MTL4CounterHeap> g_gp_heap; static gp_lab g_gp_lab[GP_MAX / 2]; static int g_gp_n, g_gp_state, g_gp_cur = -1; static long g_gp_f0 = -2, g_gp_f1, g_gp_every; static uint64_t g_gp_frame;
++static double g_gp_slow_us;   // DM_NVN_GPUPROF=slow:<ms>, in us: a frame is printed only when an encoder or its span reaches it
+ static const void *g_gp_e;   // the encoder g_gp_cur belongs to: m4_end also ends the upload / diagnostics / present encoders, which may end while a profiled pass is open (#531)
+ static _Atomic int g_gp_busy;   // a periodic profile's report has not been printed yet: the heap is still being read
+ static uint64_t g_bw_load, g_bw_store, g_gp_bw_l0, g_gp_bw_s0;   // the bandwidth ledger (defined with the pass statistics below) and its values at the last render pass end
+@@ -1616,6 +1619,8 @@
+     if (__builtin_expect(g_gp_f0 == -1, 1)) return 0;
+     if (g_gp_f0 == -2) { const char *e = getenv("DM_NVN_GPUPROF");
+         if (e && !strncmp(e, "every:", 6)) { g_gp_every = atol(e + 6); g_gp_f0 = g_gp_every > 0 ? 0 : -1; if (g_gp_every > 0) MLOG("DM_NVN_GPUPROF: one frame in every %ld profiled", g_gp_every); }
++        else if (e && !strncmp(e, "slow:", 5)) { g_gp_slow_us = atof(e + 5) * 1e3; g_gp_every = g_gp_slow_us > 0; g_gp_f0 = g_gp_every ? 0 : -1;
++            if (g_gp_every) MLOG("DM_NVN_GPUPROF: frames profiled, printed when an encoder or the frame's GPU span takes %.1f ms or more", g_gp_slow_us / 1e3); }
+         else { g_gp_f0 = e ? atol(e) : -1; g_gp_f1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : g_gp_f0; }
+         if (g_gp_f0 < 0) return 0; }
+     long f = (long)atomic_load(&g_cur_frame);
+@@ -1666,6 +1671,11 @@
+ static void gp_report(int n, gp_lab *lab, uint64_t frame) {   // the frame's last command buffer has completed
+     NSData *r = [g_gp_heap resolveCounterRange:NSMakeRange(0, 2 * n)]; const uint64_t *t = r.bytes; if (!t) { free(lab); atomic_store(&g_gp_busy, 0); return; }
+     double tick_ns = 1e9 / (double)[g_dev queryTimestampFrequency], tot[2] = {0}, span = 0; uint64_t t0 = 0, t1 = 0, ld = 0, st = 0; int np = 0;
++    if (g_gp_slow_us > 0) {   // slow:<ms>: only a frame with an encoder or a span that long
++        uint64_t s0 = 0, s1 = 0, top = 0;
++        for (int i = 0; i < n; i++) { uint64_t a = t[2 * i], b = t[2 * i + 1]; if (!a || !b || b < a) continue; if (!s0 || a < s0) s0 = a; if (b > s1) s1 = b; if (b - a > top) top = b - a; }
++        if ((double)MAX(top, s1 - s0) * tick_ns / 1e3 < g_gp_slow_us) { free(lab); atomic_store(&g_gp_busy, 0); return; }
++    }
+     for (int i = 0; i < n; i++) { uint64_t a = t[2 * i], b = t[2 * i + 1]; if (!a || !b || b < a) continue;
+         double us = (b - a) * tick_ns / 1e3; const gp_lab *l = &lab[i]; tot[l->kind != 'R'] += us;
+         if (!t0 || a < t0) t0 = a; if (b > t1) t1 = b;
+@@ -4689,6 +4699,17 @@
+ #endif
+     MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total), retired but held by a serial %u, recycled render-target heaps made %llu, reused %llu, freed %llu, waiting %u (%llu MB); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, nwait,
+          (unsigned long long)g_rh_made, (unsigned long long)g_rh_reused, (unsigned long long)g_rh_trimmed, rh_n, (unsigned long long)(rh_bytes >> 20), avail);
++    {   // local (2026-11-12): paging since the last line. GPU waits of 40-170 ms with the work already committed and no pass slow, on a 32 GB Mac with swap nearly full: a command
++        // buffer whose memory the system compressed or swapped out waits for it to come back. Process page-ins / faults and the system's swap-ins / decompressions, to set beside them
++        static uint64_t p_pi, p_f, p_si, p_dc; struct task_events_info te; mach_msg_type_number_t tn = TASK_EVENTS_INFO_COUNT; vm_statistics64_data_t vs; mach_msg_type_number_t vn = HOST_VM_INFO64_COUNT;
++        if (task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&te, &tn) == KERN_SUCCESS && host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &vn) == KERN_SUCCESS) {
++            uint64_t pi = (uint64_t)te.pageins, f = (uint64_t)te.faults, si = vs.swapins, dc = vs.decompressions;
++            if (p_f) MLOG("[paging] up to frame %llu: this process page-ins +%llu, faults +%llu; system swap-ins +%llu, decompressions +%llu, compressor %llu MB, free %llu MB", frame,
++                          (unsigned long long)(pi - p_pi), (unsigned long long)(f - p_f), (unsigned long long)(si - p_si), (unsigned long long)(dc - p_dc),
++                          (unsigned long long)((uint64_t)vs.compressor_page_count * vm_page_size >> 20), (unsigned long long)((uint64_t)vs.free_count * vm_page_size >> 20));
++            p_pi = pi; p_f = f; p_si = si; p_dc = dc;
++        }
++    }
+     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;
+       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
+       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed, %llu copied into aligned rows (%llu MB) "
+@@ -6002,9 +6023,32 @@
+ static NSString *lib_name(NSString *path) {
+     NSString *dir = g_msl_dir ? [g_msl_dir stringByAppendingString:@"/"] : nil;
+     return dir && [path hasPrefix:dir] ? [path substringFromIndex:dir.length] : path.lastPathComponent;
++}
++// Libraries with identical bytes (twins): Metal returns one library object for them, so the name lib_tag gave it was whichever twin loaded last, and the archive key of a
++// pipeline with such a shader changed from one start to the next (local, 2026-11-12, Ocarina of Time: 7,538 of 63,277 libraries in 3,586 groups; mesh bases built in one start
++// missed in the next, and about 58 bases were compiled again at each start). Each twin is named by its group's first key instead: lib_twins.tsv beside the shader map or
++// DM_NVN_LIB_TWINS=<file>, one group per line, tab-separated keys, the first one the name (twins.py). A library in no group keeps its own name
++static NSString *lib_canon(NSString *name) {
++    static NSDictionary<NSString *, NSString *> *map; static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        const char *e = getenv("DM_NVN_LIB_TWINS");
++        NSString *p = e && *e ? @(e) : [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"lib_twins.tsv"];
++        NSString *txt = p ? [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil] : nil;
++        NSMutableDictionary<NSString *, NSString *> *m = [NSMutableDictionary dictionary]; NSUInteger groups = 0;
++        for (NSString *l in [txt componentsSeparatedByString:@"\n"]) {
++            if (!l.length || [l hasPrefix:@"#"]) continue;
++            NSArray<NSString *> *c = [l componentsSeparatedByString:@"\t"];
++            if (c.count < 2) continue;
++            NSString *first = [c[0] stringByAppendingString:@".metallib"]; groups++;
++            for (NSString *k in c) m[[k stringByAppendingString:@".metallib"]] = first;
++        }
++        map = m;
++        if (txt) MLOG("shader library twins: %lu groups, %lu libraries named by their group's first key (%s)", (unsigned long)groups, (unsigned long)m.count, p.UTF8String);
++    });
++    return map[name] ?: name;
+ }
+ static id<MTLLibrary> lib_from_file_(NSString *path, NSError **err);
+-static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) { return lib_tag(lib_from_file_(path, err), lib_name(path)); }
++static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) { return lib_tag(lib_from_file_(path, err), lib_canon(lib_name(path))); }
+ static id<MTLLibrary> lib_from_file_(NSString *path, NSError **err) {
+     int fd = open(path.fileSystemRepresentation, O_RDONLY); struct stat st;
+     if (fd < 0) {   // not in the folder: the library's image, whose one descriptor is shared, and only this file's pages are mapped
+@@ -9840,9 +9884,11 @@
+ // from about 13 to 15-18 ms a frame in Breath of the Wild (the compiler's load on the shared power budget); a first start waits for them instead. It waits until every pair is
+ // handed to a worker: the compiles still under way then (at most one per worker) finish in the background, so one that does not return (a base Apple's compiler cannot build,
+ // GitHub issue #294) does not hold the game's start
++static void mtk_prebuild(void);   // nvn_geometry.inc
+ static void prepare_prebuild(void) {
+     const char *e = getenv("DM_PSO_PREBUILD"); if (e && !strcmp(e, "0")) return;
+     if (!hybrid_on()) return;
++    mtk_prebuild();   // mesh bases first: the pair prebuild below is usually done already
+     int n = pso_prebuild(prepare_workers(), 0, QOS_CLASS_USER_INITIATED);
+     if (n <= 0) return;
+     uint64_t t0 = bp_now(); int shown = 0;
+@@ -10162,6 +10208,12 @@
+     const treg_t *r = &g_treg[id_];
+     if (r->gone) { ++*gone; return 0; }
+     if (!r->view && !tex_storage_live(&r->t)) { ++*gone; *dead = 1; return 0; }
++    {   // DM_NVN_POOL_RETIRED=1 (default off; ab: alternated with the DM_AB phases): an ID whose texture the game finalized (retired: treg_retire_serial) gets the dummy without a
++        // lookup. Ocarina of Time finalizes a texture only when none of its ID slots holds it any more, so it reads no retired ID; resolving them in every walk put thousands a frame
++        // into g_ghost, whose notes refused every patch and started new epochs at scene changes (submit 29-69 ms a frame). Breath of the Wild reads render targets it finalized (g_ghost): not by default
++        static int m = -1; if (m < 0) m = sw_mode("DM_NVN_POOL_RETIRED", 0);
++        if (r->retired && sw_on(m)) return 0;
++    }
+     if (!r->view && pool_unwritten_target(&r->t)) return 0;   // dummy until a pass writes it (its new texture is noted: ser_note)
+     if (!r->view && pool_tex_size(&r->t) > limit && !pkg_shared(&r->t) && !tex_get(r->t.serial) && !(pool_seen(id_) && g_walk_req < POOL_REQ_BYTES)) { ++*left; *left_req += pool_seen(id_); return 0; }   // a texture a shader read is made whatever the budget, so it reads the dummy for a few frames at most
+     if (r->tt1 && r->tt1 - 1 != dtt) return 0;   // an ID of another texture type, seen before (the table holds only its own type): nothing to look up or charge (the idea is from PR 1428)
+--- a/dm/gfx/nvn/nvn_geometry.inc
++++ b/dm/gfx/nvn/nvn_geometry.inc
+@@ -584,6 +584,18 @@
+     for (int i = 0; i < 8; i++) pso_col4(m.colorAttachments[i], d.colorAttachments[i]);
+     return m;
+ }
++// A mesh base: the descriptor with every colour attachment left open (as pso_desc4's bases), so one base serves every colour state a draw brings (mtk_build, mtk_prebuild)
++static void mtk_open(MTL4MeshRenderPipelineDescriptor *m) {
++    for (int i = 0; i < 8; i++) {
++        MTL4RenderPipelineColorAttachmentDescriptor *a = m.colorAttachments[i];
++        a.pixelFormat = MTLPixelFormatUnspecialized; a.writeMask = MTLColorWriteMaskUnspecialized; a.blendingState = MTL4BlendStateUnspecialized;
++        a.sourceRGBBlendFactor = a.destinationRGBBlendFactor = a.sourceAlphaBlendFactor = a.destinationAlphaBlendFactor = MTLBlendFactorUnspecialized;
++        a.rgbBlendOperation = a.alphaBlendOperation = MTLBlendOperationUnspecialized;
++    }
++}
++// DM_NVN_MESH_BASE=0 turns mesh bases off (default on): every native mesh pipeline is then built whole, as before
++static int mtk_base_on(void) { static int on; static dispatch_once_t once; dispatch_once(&once, ^{ const char *e = getenv("DM_NVN_MESH_BASE"); on = !(e && !strcmp(e, "0")); }); return on; }
++static _Atomic uint64_t g_mtk_spec;   // native mesh pipelines specialized from a mesh base at their first draw
+ // A native mesh pipeline for key k (mesh shader ms, optional task shader ts, optional pixel shader fs), on any thread, kept in the pipeline archive as compute pipelines are
+ // (cps_new). With the Metal 4 compiler it is looked up in the archive files (the app's bundle among them): a hit costs a lookup, where a build took 1.9-5 s on an iPad Pro (M5)
+ // and up to 40 s on an M1 with Metal's own cache cold (Ocarina of Time). On a miss the MTLDevice builds it, which the system's shader cache serves when it holds it, and the
+@@ -605,6 +617,46 @@
+             g_mtk_arch++; if (archived) *archived = 1;
+             if (from_run && g_compact_enabled && atomic_load(&g_warm_running)) arch_harvest(m4, 1);
+             return ps;
++        }
++        // Not in the archive: specialize the set's mesh base (mtk_prebuild) with this draw's colour state, about 1 ms, where the whole build below made the draw wait 90-722 ms
++        // (Ocarina of Time). A pixel shader that reads the primitive ID gets none: a pipeline specialized from an open base reads 0 for it (pso_build_ex)
++        if (mtk_base_on() && !(fs && fs->rf.reads_prim_id)) {
++            MTL4MeshRenderPipelineDescriptor *b = mtk_desc4(d, ts, ms, ff, k->border);
++            id<MTLRenderPipelineState> base = nil;
++            if (b) { mtk_open(b); base = arch_lookup(b, 0, NULL); }
++            if (base) {
++                ps = [g_comp4 newRenderPipelineStateBySpecializationWithDescriptor:m4 pipeline:base error:error];
++                if (ps) { g_mtk_spec++; if (archived) *archived = 2; return ps; }
++                MLOG("[RED] mesh base found but not specialized: %s", error && *error ? (*error).localizedDescription.UTF8String : "no error given");
++            } else {   // no base: archive files are opened at start only, so a base built this run (mtk_prebuild) serves from the next start
++                if (archived) *archived = 3;
++                // local diagnostic (2026-11-12, run 3: 2 sets in mesh_sets.tsv missed with the prebuild's key): the prebuild's descriptor for the same shaders, and what the index knows
++                pso_key pk; memset(&pk, 0, sizeof pk);
++                pk.cfmt[0] = (uint32_t)MTLPixelFormatRG11B10Float; pk.dfmt = (uint32_t)MTLPixelFormatDepth32Float; pk.samples = 1; pk.chmask = 0xf;
++                MTLRenderPipelineDescriptor *pd = pso_desc(&pk, nil, fs, nil, 0);
++                MTL4MeshRenderPipelineDescriptor *pb = mtk_desc4(pd, ts, ms, pd.fragmentFunction ?: mtk_nop_fragment(), 0);
++                if (pb) mtk_open(pb);
++                uint64_t kb = b ? arch_key(b) : 0, kp = pb ? arch_key(pb) : 0;
++                // the same with the shader objects the prebuild uses (warm_shader), and the library each function comes from (the archive key names it)
++                NvShader *wts = ts ? warm_shader(@(ts->key), 3) : nil, *wms = warm_shader(@(ms->key), 4), *wfs = fs ? warm_shader(@(fs->key), 1) : nil;
++                uint64_t kw = 0;
++                if (wms && (!ts || wts) && (!fs || wfs)) {
++                    MTLRenderPipelineDescriptor *wd = pso_desc(&pk, nil, wfs, nil, 0);
++                    MTL4MeshRenderPipelineDescriptor *wb = mtk_desc4(wd, wts, wms, wd.fragmentFunction ?: mtk_nop_fragment(), 0);
++                    if (wb) { mtk_open(wb); kw = arch_key(wb); }
++                }
++                NSString * (^lib)(id<MTLFunction>) = ^NSString *(id<MTLFunction> f) { MTL4FunctionDescriptor *d4 = f ? fn4_of(f) : nil;
++                    if ([d4 isKindOfClass:MTL4SpecializedFunctionDescriptor.class]) d4 = ((MTL4SpecializedFunctionDescriptor *)d4).functionDescriptor;
++                    id<MTLLibrary> l = [d4 isKindOfClass:MTL4LibraryFunctionDescriptor.class] ? ((MTL4LibraryFunctionDescriptor *)d4).library : nil;
++                    return l ? (objc_getAssociatedObject(l, &g_lib_tag) ?: @"(no name)") : @"(none)"; };
++                MLOG("mesh base miss: task %s mesh %s fragment %s: draw base key %016llx (index %s), prebuild key %016llx (%s), fragment entry %s / prebuild %s, border %u; "
++                     "with the prebuild's shader objects %016llx (index %s; objects %s %s %s); libraries task %s mesh %s fragment %s",
++                     ts ? ts->key : "-", ms->key, fs ? fs->key : "-", (unsigned long long)kb, kb && nvn_hm_get(&g_arch_ix, &kb) ? "names a file" : "no file",
++                     (unsigned long long)kp, kp == kb ? "same" : "differs", ff.name.UTF8String ?: "?", pd.fragmentFunction.name.UTF8String ?: "-", k->border,
++                     (unsigned long long)kw, kw && nvn_hm_get(&g_arch_ix, &kw) ? "names a file" : "no file",
++                     wts == ts ? "same" : "other", wms == ms ? "same" : "other", wfs == fs ? "same" : "other",
++                     ts ? lib(ts->fn).UTF8String : "-", lib(ms->fn).UTF8String, fs ? lib(fs->fn).UTF8String : "-");
++            }
+         }
+     }
+     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
+@@ -616,6 +668,72 @@
+     id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:error];
+     if (ps) { if (m4) { g_mtk_built++; arch_harvest(m4, 0); } else g_mtk_dev++; }
+     return ps;
++}
++// Mesh bases (DM_NVN_MESH_BASE): one base with open colour state per task / mesh / pixel set of the game's programs, from mesh_sets.tsv beside the shader map or DM_NVN_MESH_SETS=<file>
++// (local/mesh_sets.py makes it from the RomFS with shader_split.py's readers), built in the prepare step and kept in the pipeline archive. A first draw then specializes its base (mtk_build)
++// where it built the whole pipeline while the draw waited (Ocarina of Time: 31 builds, 7.9 s, 90-722 ms each, in 27 minutes of play). The colour state is not known before the draw (12
++// states among 157 recorded pipelines, not one per shader), so the base leaves it open. Built from a typical key (one float target, no alpha test or logic operation): a draw whose pixel
++// entry point differs misses the base and builds whole as before. Once per list and depth mode (mesh_bases.tsv in the archive folder)
++static void mtk_prebuild(void) {
++    if (!mtk_base_on()) return;
++    pso4_init();
++    if (!g_comp4 || !arch_capturing()) return;
++    const char *e = getenv("DM_NVN_MESH_SETS");
++    NSString *p = e && *e ? @(e) : [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"mesh_sets.tsv"];
++    NSString *txt = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
++    if (!txt) return;
++    NSString *want = pre_stamp(txt, atomic_load(&g_depth_zero)), *stampp = [g_arch_dir stringByAppendingPathComponent:@"mesh_bases.tsv"];
++    if ([[NSString stringWithContentsOfFile:stampp encoding:NSUTF8StringEncoding error:nil] isEqualToString:want]) return;
++    NSMutableArray<NSArray<NSString *> *> *sets = [NSMutableArray array];
++    for (NSString *l in [txt componentsSeparatedByString:@"\n"]) {
++        if (!l.length || [l hasPrefix:@"#"]) continue;
++        NSArray<NSString *> *c = [l componentsSeparatedByString:@"\t"];
++        if (c.count == 3) [sets addObject:c];
++    }
++    static _Atomic int built, had, skipped, failed, done;
++    built = had = skipped = failed = done = 0;
++    int n = (int)sets.count; uint64_t t0 = bp_now();
++    MLOG("mesh bases: %d task / mesh / pixel sets of %s", n, p.UTF8String);
++    dispatch_group_t g = dispatch_group_create();
++    dispatch_group_async(g, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
++        dispatch_apply((size_t)n, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) { @autoreleasepool {
++            NSArray<NSString *> *c = sets[i];
++            int notask = [c[0] isEqualToString:@"-"], nopix = [c[2] isEqualToString:@"-"];
++            NvShader *ts = notask ? nil : warm_shader([c[0] stringByAppendingString:@"_b"], 3);
++            NvShader *ms = warm_shader([c[1] stringByAppendingString:@"_b"], 4);
++            NvShader *fs = nopix ? nil : warm_shader([c[2] stringByAppendingString:@"_b"], 1);
++            int ok = ms && ms->stage == 4 && ms->mesh_kind == 2 && ms->fn && (nopix || (fs && fs->stage == 1 && fs->fn)) &&
++                     (notask ? ms->mesh_notask : ts && ts->stage == 3 && ts->mesh_kind == 1 && ts->fn && !ms->mesh_notask) && !(fs && fs->rf.reads_prim_id);
++            MTL4MeshRenderPipelineDescriptor *b = nil;
++            if (ok) {
++                pso_key k; memset(&k, 0, sizeof k);
++                k.cfmt[0] = (uint32_t)MTLPixelFormatRG11B10Float; k.dfmt = (uint32_t)MTLPixelFormatDepth32Float; k.samples = 1; k.chmask = 0xf;
++                MTLRenderPipelineDescriptor *d = pso_desc(&k, nil, fs, nil, 0);
++                b = mtk_desc4(d, ts, ms, d.fragmentFunction ?: mtk_nop_fragment(), 0);
++            }
++            if (!b) skipped++;
++            else {
++                mtk_open(b);
++                if (arch_lookup(b, 0, NULL)) had++;
++                else {
++                    NSError *err = nil;
++                    if (arch_capture(b, &err, 0, NULL)) built++;
++                    else if (failed++ < 4) MLOG("[RED] mesh base task %s mesh %s pixel %s failed: %s", c[0].UTF8String, c[1].UTF8String, c[2].UTF8String, err.localizedDescription.UTF8String);
++                }
++            }
++            done++;
++        } });
++    });
++    int shown = 0;
++    while (dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC))) {
++        if (!shown && bp_now() - t0 >= 500000000ull) shown = 1;
++        if (shown) front_progress("Preparing mesh pipelines", done, n);
++    }
++    if (shown) front_progress(NULL, n, n);
++    mtl_arch_save(0, 0);   // written now, not at the end of the prewarm
++    [want writeToFile:stampp atomically:YES encoding:NSUTF8StringEncoding error:nil];
++    MLOG("mesh bases done: %d sets, %d built, %d already archived, %d skipped (shader missing, wrong kind, or primitive ID), %d failed, %.1f s",
++         n, (int)built, (int)had, (int)skipped, (int)failed, (bp_now() - t0) / 1e9);
+ }
+ static void mtk_bind_key(pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs) {
+     k->vs = (__bridge void *)ms; k->fs = (__bridge void *)fs;
+@@ -652,7 +770,7 @@
+     pso_skey_from(&k, ms, fs, 0, NULL, &sk); pso_skey_hex(&sk, hex);
+     pso_record("M\t%s\t%s\n", task, hex); pso_user_record("M\t%s\t%s\n", task, hex);
+     MLOG("task / mesh pipeline: task %s mesh %s fragment %s, %.1f ms%s required at frame %llu", task, ms->key, fs ? fs->key : "-",
+-         elapsed / 1e6, archived ? " (from the pipeline archive)" : "", (unsigned long long)atomic_load(&g_cur_frame));
++         elapsed / 1e6, archived == 2 ? " (specialized from a mesh base)" : archived == 3 ? " (no mesh base)" : archived ?" (from the pipeline archive)" : "", (unsigned long long)atomic_load(&g_cur_frame));
+     return ps;
+ }
+ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
+--- a/dm/host/hle_codec_video.c
++++ b/dm/host/hle_codec_video.c
+@@ -8,7 +8,7 @@
+ //     then reads the picture's properties (description 3604 until it is filled) and the picture (ReadDecoderOutputImageRgba / Nv12, the CPU route; Bananza's player takes that one)
+ //   - SubmitVp9DecoderInputBuffer takes one packet with its time and an end-of-stream flag; description 3603 when the decoder cannot take more (the client retries after the
+ //     submission-ready event).
+-// Pictures go into the released buffers in release order. Packets decode on the submitting thread; pictures with no released buffer to go into wait in a short queue, and a full
++// Pictures go into the released buffers in release order. Packets decode on the submitting thread (AV1: on a decode thread of the decoder's own, cv_av1_worker); pictures with no released buffer to go into wait in a short queue, and a full
+ // queue refuses packets. The SDK's opaque types hold a host pointer at +0 (pool: 0x20 bytes are the SDK's; decoder: 0x400), the decoder's event lives in its type at +0x100.
+ // VP8, VP9, H.264 and AV1 decoders share it all (cv_dec_*). Not served: encrypted input and alias pools.
+ // SDK 22 (Fire Emblem Fortune's Weave's movie module, subsdk2) reaches the same protocol through other names: ByTransferMemory / ByRemoteMemory initializers, a preference with an image tiling mode,
+@@ -49,7 +49,18 @@
+     uint32_t pend[CV_BUFS], phead, pcount;    // released, waiting for a picture
+     vpx_image_t *held[CV_HOLD]; int64_t held_ts[CV_HOLD]; uint8_t held_eos[CV_HOLD]; int nheld;
+     int eos_pending;
++    // local diagnostic (2026-11-12, Ocarina of Time's title movie judders): how long a packet's decode holds the submitting thread, the gaps between the player's releases
++    // (one a shown picture), and whether one thread does both; logged every 600 releases (cv_stat)
++    uint64_t st_rel_last, st_rel_n, st_gap25, st_gap50, st_gap_max, st_sub_n, st_sub17, st_sub33, st_sub_max, st_same, st_held_sum; pthread_t st_sub_thread;
++    // AV1 decodes on a host thread of its own (cv_av1_worker), not on the submitting one: dav1d's decode of a 1080p temporal unit takes 98-132 ms at times, and the player that
++    // submits is the one that releases (shows) pictures, so each such decode held the movie on one picture (Ocarina of Time's title movie, 2026-11-12: 31-55 release gaps over
++    // 50 ms per 600). Packets wait in q (nq counts them until their picture is held, so the room a packet takes is counted at submit, as when it decoded there); q_gen drops
++    // the ones a Stop or Flush overtook; dmu is held around the decoder state (the worker's decode, a reset)
++    struct cv_pkt *q_head, *q_tail; int nq, wk_on, wk_stop; uint32_t q_gen; pthread_t wk; pthread_cond_t wk_cv; pthread_mutex_t dmu;
+ } cv_dec;
++typedef struct cv_pkt { struct cv_pkt *next; uint8_t *data; size_t n; int64_t ts; uint8_t eos; uint32_t gen; } cv_pkt;
++static int cv_fill(const cv_dec *d) { return d->nheld + d->nq; }   // pictures waiting for a released buffer, and AV1 packets not decoded yet
++static uint64_t cv_now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+ 
+ static cv_dec *g_cv[16];
+ static pthread_mutex_t g_cv_mu = PTHREAD_MUTEX_INITIALIZER;   // lock order: g_cv_mu, then a decoder's mu, then g_spt_mu
+@@ -102,8 +113,7 @@
+ // Pictures and end of stream into the released buffers, in order (decoder lock held). The event says a packet can come: it rises when one was taken (took) or room came back, not at every release.
+ // Mario Tennis Fever's player counts each signal as one packet it may send: raised at every release, its count grew while a seek held back the samples (a skipped cutscene),
+ // and the packets it then sent overran CV_HOLD
+-static void drain(cv_dec *d, int took) {
+-    int before = d->nheld;
++static void drain_at(cv_dec *d, int took, int before) {   // before: cv_fill when the change that led here began
+     while (d->pcount && (d->nheld || d->eos_pending)) {
+         uint32_t i = d->pend[d->phead]; d->phead = (d->phead + 1) % CV_BUFS; d->pcount--;
+         typeof(d->buf[0]) *b = &d->buf[i];
+@@ -119,8 +129,9 @@
+         b->filled = 1; b->filled_gen = b->gen;
+         spt_fire(d, i);
+     }
+-    if (d->event) { if (d->nheld >= CV_READY) hle_clear_system_event(d->event); else if (took || before >= CV_READY) hle_signal_system_event(d->event); }
++    if (d->event) { if (cv_fill(d) >= CV_READY) hle_clear_system_event(d->event); else if (took || before >= CV_READY) hle_signal_system_event(d->event); }
+ }
++static void drain(cv_dec *d, int took) { drain_at(d, took, cv_fill(d)); }
+ 
+ HLE_FORCE("_ZN2nn5codec5video10InitializeEv", "the decoder service is the host's (hle_codec_video.c)", Result, h_cv_init, void) { return 0; }
+ HLE_FORCE("_ZN2nn5codec5video8FinalizeEv", "the decoder service is the host's", Result, h_cv_fin, void) { return 0; }
+@@ -236,6 +247,11 @@
+ 
+ // One host decoder for every codec the SDK has a decoder type for (Vp8 / Vp9 / H264 / Av1DecoderType: the same layout, its event at +8 in the SDK, all calls taken over here):
+ // VP8 and VP9 through libvpx, H.264 through VideoToolbox and AV1 through VideoToolbox or dav1d (hle_movie_avc.c, hle_movie_av1.c, whose NV12 pictures are copied into the pool as I420)
++static void *cv_av1_worker(void *arg);
++static void cv_drop_queue(cv_dec *d) {   // packets not decoded yet are dropped (decoder lock held)
++    for (cv_pkt *p = d->q_head, *n; p; p = n) { n = p->next; free(p->data); free(p); d->nq--; }
++    d->q_head = d->q_tail = NULL;
++}
+ static void cv_open(cv_dec *d) {   // (re)creates the codec state: a new stream starts at the next key frame
+     if (d->codec == CV_AV1) {
+         if (!d->av1) d->av1 = mav1_new(); else mav1_reset(d->av1);
+@@ -250,7 +266,7 @@
+ }
+ static Result cv_dec_init(void *t, int codec, uint16_t w, uint16_t h, uint32_t in, uint32_t out, const void *csd, uint64_t csd_n) {
+     cv_dec *d = calloc(1, sizeof *d);
+-    d->magic = CV_MAGIC; d->codec = codec; d->w = w; d->h = h; pthread_mutex_init(&d->mu, NULL);
++    d->magic = CV_MAGIC; d->codec = codec; d->w = w; d->h = h; pthread_mutex_init(&d->mu, NULL); pthread_mutex_init(&d->dmu, NULL); pthread_cond_init(&d->wk_cv, NULL);
+     if (csd && csd_n && csd_n < (1u << 20)) { d->csd = malloc((size_t)csd_n); memcpy(d->csd, csd, (size_t)csd_n); d->csd_n = (size_t)csd_n; }
+     cv_open(d);
+     pthread_mutex_lock(&g_cv_mu);
+@@ -258,6 +274,7 @@
+     pthread_mutex_unlock(&g_cv_mu);
+     if (!d->id) die("nn::codec: more than 16 video decoders");
+     d->event = (uint8_t *)t + CV_EVENT_OFF; hle_bind_system_event(d->event, 0); hle_signal_system_event(d->event);
++    if (codec == CV_AV1) { if (pthread_create(&d->wk, NULL, cv_av1_worker, d)) die("nn::codec: AV1 decode thread"); d->wk_on = 1; }
+     *(cv_dec **)t = d;
+     LOG("[codec] %s decoder %u: %ux%u, input format %u, output format %u%s (%s on the host)", k_cv_name[codec], d->id, w, h, in, out,
+         d->csd_n ? ", with parameter sets" : "", codec == CV_AV1 ? mav1_backend(d->av1) : codec == CV_H264 ? "VideoToolbox" : "libvpx");
+@@ -265,6 +282,10 @@
+ }
+ static Result cv_dec_fin(void *t) {
+     cv_dec *d = cv_of(t); if (!d) return 0;
++    if (d->wk_on) {   // the decode thread stops first (it finishes a decode in flight): it signals this decoder's events and writes its buffers
++        pthread_mutex_lock(&d->mu); d->wk_stop = 1; pthread_cond_signal(&d->wk_cv); pthread_mutex_unlock(&d->mu);
++        pthread_join(d->wk, NULL); cv_drop_queue(d); d->wk_on = 0;
++    }
+     pthread_mutex_lock(&g_cv_mu); g_cv[d->id - 1] = NULL; pthread_mutex_lock(&d->mu); pthread_mutex_unlock(&d->mu); pthread_mutex_unlock(&g_cv_mu);   // no sync handle lookup is still inside
+     if (d->codec != CV_H264 && d->codec != CV_AV1 && d->vpx_ok) vpx_codec_destroy(&d->vpx);
+     if (d->avc) mavc_free(d->avc);
+@@ -275,7 +296,7 @@
+     // event "bound" and was not given one: the game had cleared that memory, and nn::os aborted on the uninitialised event (Donkey Kong Bananza, its second movie)
+     static void (*destroy)(void *); if (!destroy && !(destroy = guest_sym("_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE"))) die("nn::os::DestroySystemEvent missing");
+     destroy(d->event);
+-    pthread_mutex_destroy(&d->mu); free(d); *(cv_dec **)t = NULL;
++    pthread_mutex_destroy(&d->mu); pthread_mutex_destroy(&d->dmu); pthread_cond_destroy(&d->wk_cv); free(d); *(cv_dec **)t = NULL;
+     return 0;
+ }
+ static Result cv_dec_reg(void *t, uint32_t i, void *pool, uint32_t pidx) {
+@@ -302,12 +323,15 @@
+ }
+ static Result cv_dec_reset(void *t) {   // Stop / Flush: pictures not yet given to a buffer and a pending end of stream are dropped, the decoder starts over at the next key frame
+     cv_dec *d = cv_of(t); if (!d) return 0;
++    pthread_mutex_lock(&d->dmu);   // a decode in flight on the AV1 thread ends first; its picture is then dropped (q_gen). Order: dmu, then mu; the thread never holds both
+     pthread_mutex_lock(&d->mu);
+     for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]);
+     d->nheld = 0; d->eos_pending = 0;
++    cv_drop_queue(d); d->q_gen++;
+     cv_open(d);
+     if (d->event) hle_signal_system_event(d->event);
+     pthread_mutex_unlock(&d->mu);
++    pthread_mutex_unlock(&d->dmu);
+     return 0;
+ }
+ // A started decoder that has room takes packets, whatever became of the signal Initialize gave. Mario Tennis Fever's player (nro0+0xd19d18) clears that one and drops it while it is not yet started,
+@@ -315,7 +339,7 @@
+ static Result cv_dec_start(void *t) {
+     cv_dec *d = cv_of(t); if (!d) return CV_R(2004);
+     pthread_mutex_lock(&d->mu);
+-    if (d->event && d->nheld < CV_READY) hle_signal_system_event(d->event);
++    if (d->event && cv_fill(d) < CV_READY) hle_signal_system_event(d->event);
+     pthread_mutex_unlock(&d->mu);
+     return 0;
+ }
+@@ -343,30 +367,69 @@
+     }
+     return c;
+ }
+-// One packet: decoded at once; its pictures wait for released buffers (end of stream marks the last one, or comes as a buffer of its own).
++// The AV1 decode thread: one packet at a time, in submit order. It decodes with no decoder lock held (dmu only), then holds the picture and fills released buffers as a submit did
++static void *cv_av1_worker(void *arg) {
++    cv_dec *d = arg;
++    pthread_setname_np("nn::codec AV1 decode");
++    pthread_mutex_lock(&d->mu);
++    for (;;) {
++        while (!d->q_head && !d->wk_stop) pthread_cond_wait(&d->wk_cv, &d->mu);
++        if (d->wk_stop) break;
++        cv_pkt *p = d->q_head; d->q_head = p->next; if (!d->q_head) d->q_tail = NULL;
++        pthread_mutex_unlock(&d->mu);
++        vpx_image_t *c = NULL; uint64_t t0 = cv_now_ns();
++        if (p->n) {   // the picture is copied out before dmu is let go: a reset unlocks the decoder's picture
++            pthread_mutex_lock(&d->dmu);
++            mav1_picture pic;
++            if (p->gen == d->q_gen && mav1_decode(d->av1, p->data, p->n, &pic) == 1) c = av1_to_i420(&pic);
++            pthread_mutex_unlock(&d->dmu);
++        }
++        uint64_t dt = cv_now_ns() - t0;
++        pthread_mutex_lock(&d->mu);
++        int before = cv_fill(d); d->nq--;
++        if (p->gen != d->q_gen) { if (c) vpx_img_free(c); }   // a Stop or Flush came first: the reset already dropped what this stream had
++        else {
++            int got = c ? cv_hold(d, c, p->ts) : 0;
++            if (p->n) { d->st_sub_n++; d->st_sub17 += dt > 16667000; d->st_sub33 += dt > 33333000; if (dt > d->st_sub_max) d->st_sub_max = dt; }
++            if (p->eos) { if (got) d->held_eos[d->nheld - 1] = 1; else d->eos_pending = 1; }
++        }
++        drain_at(d, 0, before);
++        free(p->data); free(p);
++    }
++    pthread_mutex_unlock(&d->mu);
++    return NULL;
++}
++// One packet: decoded at once (AV1: on its own thread, above); its pictures wait for released buffers (end of stream marks the last one, or comes as a buffer of its own).
+ // A refusal (CV_BUSY, nn::codec 3603) is the decoder's defined answer, not a fault: NintendoSDK_movie's detail::SubmitDecoderInputBuffer turns exactly that result into its
+ // own retry code 0x7a, which VideoDecoder::DecodeAsync hands back to the player, and aborts on any other failure (Ocarina of Time's subsdk0 +0x10fd20, +0x103840). So it is
+ // logged plainly; a picture the host has to drop prints its own [RED] line (cv_hold)
+ static Result cv_dec_submit(uint64_t *out, void *t, const void *data, uint64_t size, int64_t ts, bool eos) {
+     cv_dec *d = cv_of(t); if (!d) return CV_R(2004);
+     pthread_mutex_lock(&d->mu);
+-    if (d->nheld >= CV_HOLD) { static int n; if (n++ < 4) LOG("nn::codec %s: busy (result 3603), a packet refused with %d pictures waiting for a released buffer",k_cv_name[d->codec], d->nheld); if (d->event) hle_clear_system_event(d->event); pthread_mutex_unlock(&d->mu); return CV_BUSY; }
+-    int got = 0;
++    if (cv_fill(d) >= CV_HOLD) { static int n; if (n++ < 4) LOG("nn::codec %s: busy (result 3603), a packet refused with %d pictures waiting for a released buffer and %d packets for the decode thread", k_cv_name[d->codec], d->nheld, d->nq); if (d->event) hle_clear_system_event(d->event); pthread_mutex_unlock(&d->mu); return CV_BUSY; }
++    int got = 0; uint64_t st_t0 = cv_now_ns();
+     if (d->codec == CV_H264 && d->avc) {   // VideoToolbox reorders: pictures leave in presentation order, all of them at the end of the stream
+         if (size && mavc_decode(d->avc, data, (int)size, ts / 1000) < 0) { static int n; if (n++ < 4) LOG("[RED] nn::codec H.264: VideoToolbox could not decode a packet"); }
+         uint8_t *nv12 = malloc((size_t)d->w * d->h * 3 / 2); int64_t pts = 0;
+         while (nv12 && d->nheld < CV_HOLD && mavc_take(d->avc, eos, nv12, d->w, d->h, &pts) == 1) { vpx_image_t *c = nv12_to_i420(nv12, d->w, d->h); if (c) got += cv_hold(d, c, pts * 1000); }
+         free(nv12);
+-    } else if (d->codec == CV_AV1) {
+-        if (size) {
+-            mav1_picture pic;
+-            if (mav1_decode(d->av1, data, (size_t)size, &pic) == 1) { vpx_image_t *c = av1_to_i420(&pic); if (c) got += cv_hold(d, c, ts); }
+-        }
++    } else if (d->wk_on) {   // AV1: the packet (a copy: the game may reuse its memory) goes to the decode thread, end of stream too, in order
++        cv_pkt *p = calloc(1, sizeof *p); if (!p || (size && !(p->data = malloc((size_t)size)))) die("nn::codec: AV1 packet allocation");
++        if (size) memcpy(p->data, data, (size_t)size);
++        p->n = (size_t)size; p->ts = ts; p->eos = eos; p->gen = d->q_gen;
++        if (d->q_tail) d->q_tail->next = p; else d->q_head = p;
++        d->q_tail = p; d->nq++; pthread_cond_signal(&d->wk_cv);
++        d->st_sub_thread = pthread_self();
++        *out = ++d->submits;
++        drain(d, 1);
++        pthread_mutex_unlock(&d->mu);
++        return 0;
+     } else if (size && d->vpx_ok) {
+         if (vpx_codec_decode(&d->vpx, data, (unsigned)size, NULL, 0) != VPX_CODEC_OK) { static int n; if (n++ < 4) LOG("[RED] nn::codec %s: %s (%s)", k_cv_name[d->codec], vpx_codec_error(&d->vpx), vpx_codec_error_detail(&d->vpx) ? vpx_codec_error_detail(&d->vpx) : ""); }
+         vpx_codec_iter_t it = NULL; const vpx_image_t *im;
+         while ((im = vpx_codec_get_frame(&d->vpx, &it))) { vpx_image_t *c = img_copy(im); if (c) got += cv_hold(d, c, ts); }
+     }
++    if (size) { uint64_t dt = cv_now_ns() - st_t0; d->st_sub_n++; d->st_sub17 += dt > 16667000; d->st_sub33 += dt > 33333000; if (dt > d->st_sub_max) d->st_sub_max = dt; d->st_sub_thread = pthread_self(); }
+     if (eos) { if (got) d->held_eos[d->nheld - 1] = 1; else d->eos_pending = 1; }
+     *out = ++d->submits;
+     drain(d, 1);
+@@ -385,6 +448,18 @@
+ static void cv_dec_rel(void *t, uint32_t i, cv_sync sync) {
+     (void)sync; cv_dec *d = cv_of(t); if (!d || i >= CV_BUFS || !d->buf[i].reg) { LOG("[RED] nn::codec::Release…DecoderOutputBuffer index %u", i); return; }
+     pthread_mutex_lock(&d->mu);
++    {   // the diagnostic's release side (see cv_dec)
++        uint64_t now = cv_now_ns(), gap = d->st_rel_last ? now - d->st_rel_last : 0; d->st_rel_last = now; d->st_rel_n++;
++        d->st_gap25 += gap > 25000000; d->st_gap50 += gap > 50000000; if (gap > d->st_gap_max) d->st_gap_max = gap;
++        d->st_same += d->st_sub_n && pthread_equal(pthread_self(), d->st_sub_thread); d->st_held_sum += (uint64_t)d->nheld;
++        if (d->st_rel_n % 600 == 0) {
++            LOG("[codec] %s decoder %u, last 600 releases: gaps over 25 ms %llu, over 50 ms %llu, longest %.1f ms; held pictures at release %.1f on average; %llu packets decoded, "
++                "over 16.7 ms %llu, over 33.3 ms %llu, longest %.1f ms; releases on the submitting thread %llu", k_cv_name[d->codec], d->id,
++                (unsigned long long)d->st_gap25, (unsigned long long)d->st_gap50, d->st_gap_max / 1e6, d->st_held_sum / 600.0, (unsigned long long)d->st_sub_n,
++                (unsigned long long)d->st_sub17, (unsigned long long)d->st_sub33, d->st_sub_max / 1e6, (unsigned long long)d->st_same);
++            d->st_gap25 = d->st_gap50 = d->st_gap_max = d->st_sub_n = d->st_sub17 = d->st_sub33 = d->st_sub_max = d->st_same = d->st_held_sum = 0;
++        }
++    }
+     d->buf[i].gen++; d->buf[i].filled = 0;
+     if (d->pcount < CV_BUFS) { d->pend[(d->phead + d->pcount) % CV_BUFS] = i; d->pcount++; }
+     if (d->fcount < 8) { d->fifo[(d->fhead + d->fcount) % 8] = i; d->fcount++; } else LOG("[RED] nn::codec: acquirable queue full at release %u", i);

@@ -1,6 +1,6 @@
 # OotM1: state of the test work on an M1 Max
 
-Status on 2026-11-11. This page describes a private test tree, not the released app. Most of the settings named here are not in this repository's `main` yet. The table in "What the test tree holds" says which.
+Status on 2026-11-11, with the results of 12 Nov added in "Results of 12 Nov: scene changes, the opening movie and the city". This page describes a private test tree, not the released app. Most of the settings named here are not in this repository's `main` yet. The table in "What the test tree holds" says which.
 
 - Game: Ocarina of Time (Switch 2).
 - Machine: MacBook Pro with M1 Max, 32 GB, 120 Hz variable refresh screen, macOS 26.6.
@@ -70,7 +70,7 @@ Frame generation is in the test build and is not ready:
 
 What did not help, each measured: fewer or merged submissions, the encode thread on or off, the GPU clock held at its top frequency, GPU overlap, and the copy seam switch.
 
-The changes written in the test tree are in [`patches/`](../patches/series) (21 to 23, and 90 for the default settings).
+The changes written in the test tree are in [`patches/`](../patches/series) (21 to 24, and 90 for the default settings).
 
 ## Results of 11 Nov (build 5, the game's own resolution)
 
@@ -125,6 +125,38 @@ What was tried:
 Conclusion: on this GPU, running more work side by side helps little, because each heavy step already keeps the cores busy. The time left to win is the short waits between steps and between command buffers.
 
 Not explained: in one run the frame took 19.3 ms in both A/B states, and in later runs 16.7 ms in both states. The code was the same, so the run conditions changed.
+
+## Results of 12 Nov: scene changes, the opening movie and the city
+
+A 27-minute play log (92,100 frames) showed three kinds of drops at scene changes and new places. Each was traced to its cause before anything was built.
+
+**1. The host's texture table (fixed, on by default).**
+
+- After a scene change the game leaves thousands of texture slots pointing at textures it has freed. The host looked each one up when it rebuilt its texture table.
+- A table of 512 freed textures overflowed. Every lookup missed, its notes overflowed, and the host rebuilt the whole table every frame. Host CPU was 29 to 69 ms a frame against 7 ms, in stretches of up to 15 s.
+- The game's code shows that it frees a texture only when no slot holds it any more, and it does not read a freed slot again before it fills it with a new texture. So the host now gives such a slot a placeholder (`DM_NVN_POOL_RETIRED=1`).
+- Test runs (about 5 and 20 minutes): no table overflow in any block, worst host CPU a frame 8.3 to 8.4 ms (was 68.7), no block with a median over 20 ms (was 6), and no picture fault seen.
+
+**2. Pipelines built at the first draw (partly fixed, needs lists).**
+
+- The host built mesh pipelines that were not in its archive while the frame waited: 31 builds and 7.9 s of freezes in the long play, the longest 722 ms.
+- Fix: one base pipeline per set of game shaders is built before the first frame, and a draw specializes it in a few ms (`DM_NVN_MESH_SETS`).
+- A second fault kept those bases from being found. Many translated shader libraries are byte-identical, and Metal returns one object for equal bytes. The host named that object after whichever twin loaded last, so the archive key of a pipeline changed at every start. A list of the twins (`DM_NVN_LIB_TWINS`) gives each group one fixed name. After it, a start compiled 0 bases (was 58 every start), the prepare step took 4.6 s (was 7.1 s), and no mesh pipeline was built at a draw.
+- Both lists are made from the game's own files, so they are not in this repository. Without them the fix does nothing.
+
+**3. Loads.** A scene's first texture uploads (up to about 250 MB) take 0.3 to 0.9 s once. Not changed.
+
+**GPU pauses between frames.** In the city, the GPU sometimes waited 40 to 160 ms between command buffers that were already sent, with no slow pass. The Mac had 9.2 of 10 GB of swap in use, and browsers and a chat app were open. With them closed, these waits fell from 4.4 to 0.2 to 0.42 per 1,000 frames. Memory pressure is the likely cause. It is not proven.
+
+**The opening movie (fixed).**
+
+- The movie is AV1, 1920 × 1080 at 60 frames a second. The M1 has no AV1 decoder, so the CPU decodes it.
+- Most pictures take about 9 ms to decode, but 1 in 100 takes 88 to 132 ms. The host decoded each packet on the game's movie thread, which is also the thread that shows the pictures. A slow picture held the movie on one picture.
+- Measured: 31 to 55 pauses over 50 ms per 600 pictures, the longest 217 ms.
+- Fix: the host decodes on its own thread and the game's call returns at once. The game still sees the same buffer limits. A simulation over the real decode times showed no late picture once the decoder can run 8 pictures ahead, and the host allows 12.
+- After: 1 to 6 pauses over 50 ms per 600 pictures. The tester: "the cut scene is great now".
+
+**The city.** Hyrule Castle Town market: frame median 16.6 to 18.4 ms, 95th percentile 18.3 to 22 ms, GPU about 17.3 ms a frame. It is limited by the GPU. The host's per-pass timer counts waiting as GPU work, so the next step is a Metal System Trace in the market with each pass named (`DM_NVN_ENC_LABEL=1`), and a fix only for what that trace shows.
 
 ## The model
 

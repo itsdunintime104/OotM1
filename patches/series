@@ -24,4 +24,5 @@ fixup-20-1846-2090.diff
 21-copy-seam.diff
 22-mdx-seam-and-async-compute.diff
 23-test-tree-local-edits.diff
+24-scene-changes-and-movie.diff
 90-m1max-defaults.diff
