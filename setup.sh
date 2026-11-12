@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Builds OotM1 (the Switch 2 game 0400486024DEC000, update v131072) as a Mac app with the patches of this repository.
+# Builds OotM1 (Switch 2) as a Mac app with the patches of this repository.
 # Usage: ./setup.sh <file.nup> [--check] [--tree <dir>] [--work <dir>] [--no-install]
 set -e
 autoload -Uz is-at-least

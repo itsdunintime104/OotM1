@@ -1,5 +1,5 @@
 > [!IMPORTANT]
-> This project does not include any game files. You need your own copy of Ocarina of Time for Nintendo Switch 2 (title ID `0400486024DEC000`), as a `.nup` file.
+> This project does not include any game files. You need your own copy of Ocarina of Time for Nintendo Switch 2, as a `.nup` file.
 
 <h1 align="center">OotM1</h1>
 
@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT">
 </p>
 
-A set of patches and one setup script that build Ocarina of Time (Switch 2, title `0400486024DEC000`, update v131072) as a native Mac app, tuned for a MacBook Pro with M1 Max. It runs at the game's own resolution with a 2560 × 1440 picture at about 55 to 60 frames a second.
+A set of patches and one setup script that build Ocarina of Time (Switch 2) as a native Mac app, tuned for a MacBook Pro with M1 Max. It runs at the game's own resolution with a 2560 × 1440 picture at about 55 to 60 frames a second.
 
 The engine is [seedds/nxnative](https://github.com/seedds/nxnative). This repository pins one of its commits, adds open pull requests of that project and the M1 Max work on top, and sets the app's default settings to the ones that measured best.
 
@@ -34,7 +34,7 @@ This project is not affiliated with or endorsed by Nintendo.
 - Xcode 27.2, with its Metal toolchain
 - Homebrew, with `xcodegen`, `zstd`, `glslang` and the .NET SDK
 - Python 3.12 or newer (arm64)
-- Your own `.nup` file of the game with update v131072
+- Your own `.nup` file of the game, with the same update as the tested build (another update may not work)
 - About 80 GB of free disk space for the first build (the extracted game and the shader cache are kept for the next build)
 
 ## Install
@@ -115,13 +115,13 @@ Known faults:
 - **`setup.sh` stops at the check.** It names what is missing and how to install it.
 - **macOS will not open the app.** Sign it once: `codesign -f -s - ~/Applications/OotM1.app` (takes a few minutes).
 - **Low frame rate.** Connect the power adapter and set High Power mode (System Settings → Battery). Close other apps that use the GPU.
-- **The log.** `~/Library/Logs/nxnative/0400486024DEC000.log`, replaced at each start; the run before is kept as `.prev.log`.
+- **The log.** The game's log is in `~/Library/Logs/nxnative/`, replaced at each start; the run before is kept as `.prev.log`.
 
 ## Building and development
 
 - `patches/series` lists the patches in order. Patches that carry upstream code with game code references are not stored here: `setup.sh` makes them from upstream pull requests and commits at pinned commits and checks their SHA-256 (`patches/upstream.tsv`). Where the tested patch differs from the public one, a `fixup-*.diff` in `patches/` holds only the difference.
 - `patches/90-m1max-defaults.diff` holds the default settings above.
-- Each host change can be switched with its environment variable in `~/Library/Application Support/nxnative/0400486024DEC000/env.txt`, one `NAME=value` per line.
+- Each host change can be switched with its environment variable in `env.txt`, in the game's folder under `~/Library/Application Support/nxnative/`, one `NAME=value` per line.
 
 ## Credits
 
