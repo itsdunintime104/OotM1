@@ -1,5 +1,5 @@
 > [!IMPORTANT]
-> This project does not include any game files. You need your own copy of OoT for Nintendo Switch 2 (title ID `0400486024DEC000`), as a `.nup` file.
+> This project does not include any game files. You need your own copy of Ocarina of Time for Nintendo Switch 2 (title ID `0400486024DEC000`), as a `.nup` file.
 
 <h1 align="center">OotM1</h1>
 
@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT">
 </p>
 
-A set of patches and one setup script that build OoT (Switch 2, title `0400486024DEC000`, update v131072) as a native Mac app, tuned for a MacBook Pro with M1 Max. It runs at the game's own resolution with a 2560 × 1440 picture at about 55 to 60 frames a second.
+A set of patches and one setup script that build Ocarina of Time (Switch 2, title `0400486024DEC000`, update v131072) as a native Mac app, tuned for a MacBook Pro with M1 Max. It runs at the game's own resolution with a 2560 × 1440 picture at about 55 to 60 frames a second.
 
 The engine is [seedds/nxnative](https://github.com/seedds/nxnative). This repository pins one of its commits, adds open pull requests of that project and the M1 Max work on top, and sets the app's default settings to the ones that measured best.
 
