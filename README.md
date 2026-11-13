@@ -114,14 +114,23 @@ Fixed on 12 Nov (`patches/24-scene-changes-and-movie.diff`):
 - **Long slowdowns after scene changes.** After a scene change the host looked up thousands of texture slots a frame that point at textures the game had already freed. A small table overflowed, and the host rebuilt its texture table every frame: 29 to 69 ms of CPU a frame, for up to 15 s. The game never reads such a slot, so the host now gives it a placeholder. In the test runs the worst host CPU time a frame fell from 68.7 ms to 8.3 ms. On by default.
 - **Laggy opening movie.** The movie is AV1, which the M1 decodes on the CPU. A slow picture (up to 132 ms) held the game's movie thread, so the movie stopped on one picture. Decoding now runs on its own thread. Pauses over 50 ms fell from 31 to 55 to 1 to 6 per 600 pictures, and the tester called it great.
 
+### In the test build, not yet in these patches (13 Nov)
+
+The work below runs in the test build. It is not in `patches/` yet, so `setup.sh` does not build it.
+
+- **Frame generation pacing.** With frame generation on, the frame rate swung between about 70 and 30 frames a second. The host counted the frame generation's GPU time wrongly, so it held frames it did not need to hold. It now counts the frame generation's measured work, and the time the GPU is busy rather than the sum of buffers that overlap. In Hyrule Field the result was a steady 30 + 30, with no hold changes (17 to 30 before). The tester found that locked rate choppy and preferred the variable one, so holding stays a setting.
+- **Real-time game speed below 60.** The game's time step now follows the measured frame time, not whole 1/60 s steps. In Hyrule Field with frame generation on, game time ran at 0.97 to 0.99 of real time at about 43 real frames a second. Off by default.
+- **Smaller host fixes.** Queue work held back at loads now runs on the encode thread, not on the game's thread. Shared textures that nothing has used for 600 submissions are released.
+- **Measured: Hyrule Field's grass is limited by the GPU.** A frame's GPU work spans 15.6 to 17.8 ms, and the GPU is idle for about 5 ms of it. The cause of that idle time is not found yet. A steady 60 + 60 with frame generation needs about 5 ms less GPU time per real frame.
+
 Known faults:
 
 - **Freezes at the first visit to a place**, up to about 0.7 s. The host builds a new pipeline while the frame waits. The second visit does not freeze. A fix that builds them before the first frame is in patch 24, but it needs two lists made from your own game files, which this repository does not ship (`DM_NVN_MESH_SETS`, `DM_NVN_LIB_TWINS`). Without the lists it does nothing.
 - **Hitches of 40 to 200 ms**, where the GPU stops between two frames that are ready. They come with memory pressure: with browsers and chat apps closed, they fell from 4.4 to 0.2 to 0.4 per 1,000 frames. This is a strong sign, not a proof.
-- **Below 60 in the city.** The heaviest places are limited by the GPU. Measuring them is the next step.
+- **Below 60 in the city and in Hyrule Field's grass.** These places are limited by the GPU (see above).
 - **A white glow on some textures in the city**, seen by the tester. The cause is not found yet.
-- Below 60 the game moves in whole steps of 1/60 s, so motion can speed up and slow down.
-- Frame generation is experimental.
+- Below 60 the game moves in whole steps of 1/60 s, so motion can speed up and slow down. The test build fixes this (see above).
+- Frame generation is experimental. Its frame rate can swing between about 70 and 30. The test build fixes this (see above).
 - Above 60 frames a second is not possible yet: the game's time step is handed over in whole 1/60 s steps.
 
 ## Troubleshooting
@@ -138,6 +147,16 @@ Known faults:
 - `patches/23-test-tree-local-edits.diff` and `patches/24-scene-changes-and-movie.diff` hold the M1 Max work. Patch 24 also adds diagnostics to the log: `DM_NVN_GPUPROF=slow:<ms>` prints the per-pass GPU times of frames that take at least that long, a `[paging]` line reports swap and page-ins, and the movie decoder reports its pauses every 600 pictures.
 - `patches/90-m1max-defaults.diff` holds the default settings above.
 - Each host change can be switched with its environment variable in `env.txt`, in the game's folder under `~/Library/Application Support/nxnative/`, one `NAME=value` per line.
+
+### Rebuild after a change
+
+- **New patches from this repository.** Run `git pull`, then run `./setup.sh` again with the same `.nup` file and the same options (the same `--work` folder, if you gave one). The build reuses the extracted game and the shader cache, and skips the steps whose inputs did not change.
+- **Your own change to the engine.** `setup.sh` resets `engine/` to the pinned commit and applies `patches/series` again, so a change made in `engine/` is lost at the next run. Save it as a patch first:
+  ```sh
+  git -C engine diff > patches/25-my-change.diff
+  ```
+  Then add `25-my-change.diff` to `patches/series`, above `90-m1max-defaults.diff`, and run `./setup.sh` again. `git diff` holds only your change, because `setup.sh` stages the patches it applies.
+- **Settings only.** A change to `env.txt` needs no rebuild. It applies at the next start of the game.
 
 ## Credits
 
