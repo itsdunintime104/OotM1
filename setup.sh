@@ -9,6 +9,7 @@ REPO_URL=https://github.com/seedds/nxnative.git
 BASE=04811a634b7f9344e882129b0973dd493369dd62
 APP_NAME="OotM1.app"
 MIN_FREE_GB=80
+APP_FREE_GB=40                    # the app is about 32 GB
 ROWS_COMMENT="# Rows below from seedds/nxnative#1732 (40,154 entries regenerated on main, recorded through Kokiri Forest, the Great Deku Tree, Hyrule Field, Kakariko Village, Dodongo's Cavern, Zora's Domain, Jabu-Jabu's Belly and the Forest Temple), those not already listed above."
 
 usage() {
@@ -23,7 +24,7 @@ EOF
 die() { print -u2 -- "setup.sh: $*"; exit 1; }
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
-NUP= CHECK_ONLY=0 TREE=$PWD/engine WORK= INSTALL=1 TREE_ONLY=0 DEFAULTS=1
+NUP= CHECK_ONLY=0 TREE=$PWD/engine WORK= INSTALL=1 TREE_ONLY=0 VENV_ONLY=0 TRANSLATOR_ONLY=0 DEFAULTS=1 PY= PYV=
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) CHECK_ONLY=1 ;;
@@ -31,6 +32,8 @@ while [ $# -gt 0 ]; do
     --work) [ -n "$2" ] || die "--work needs a folder"; WORK=$2; shift ;;
     --no-install) INSTALL=0 ;;
     --tree-only) TREE_ONLY=1 ;;      # not in the usage: make the engine source only (for checking the patches)
+    --venv-only) VENV_ONLY=1 ;;      # not in the usage: make the Python environment only
+    --translator-only) TRANSLATOR_ONLY=1 ;;   # not in the usage: make the engine source, the Python environment and the shader translator only
     --no-defaults) DEFAULTS=0 ;;     # not in the usage: leave out 90-m1max-defaults.diff
     -h|--help) usage; exit 0 ;;
     -*) usage; die "unknown option $1" ;;
@@ -40,8 +43,20 @@ while [ $# -gt 0 ]; do
 done
 TREE=${TREE:A}
 
+find_python() {   # sets PY and PYV to the first Python that is arm64 and 3.12 or newer; returns 1 when there is none
+  local c p3 cands=()
+  if [ -n "$OOTM1_PYTHON" ]; then cands=("$OOTM1_PYTHON")      # set: the only candidate
+  else p3=$(command -v python3) || p3=; cands=(/opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3 $p3); fi   # 3.14 first: newer ones may lack package wheels
+  for c in $cands; do
+    if [ -x "$c" ] && "$c" -c 'import sys, platform; sys.exit(not (sys.version_info >= (3, 12) and platform.machine() == "arm64"))' 2>/dev/null; then
+      PY=$c; PYV=$("$c" -c 'import platform; print(platform.python_version())'); return 0
+    fi
+  done
+  return 1
+}
+
 check_requirements() {   # prints each missing requirement with its fix; returns 1 when one is missing
-  local miss=() v where free
+  local miss=() v where app free
   [ "$(uname -m)" = arm64 ] || miss+=("a Mac with Apple silicon (this one is $(uname -m))")
   v=$(sw_vers -productVersion 2>/dev/null)
   is-at-least 26.6 "$v" || miss+=("macOS 26.6 or later (this Mac has $v): update macOS in System Settings")
@@ -53,12 +68,20 @@ check_requirements() {   # prints each missing requirement with its fix; returns
   command -v zstd > /dev/null || miss+=("zstd: brew install zstd")
   command -v glslangValidator > /dev/null || miss+=("glslang: brew install glslang")
   command -v dotnet > /dev/null || miss+=("the .NET SDK: brew install --cask dotnet-sdk")
-  python3 -c 'import sys, platform; sys.exit(not (sys.version_info >= (3, 12) and platform.machine() == "arm64"))' 2>/dev/null \
-    || miss+=("Python 3.12 or newer for arm64 as python3: brew install python")
+  if find_python; then print "Python: $PY ($PYV)"
+  else miss+=("Python 3.12 or newer for arm64: brew install python@3.14 (or set OOTM1_PYTHON to one)${OOTM1_PYTHON:+; OOTM1_PYTHON is $OOTM1_PYTHON, which is not one}"); fi
   where=${WORK:-${NUP:+${NUP:A:h}}}; where=${where:-$PWD}
   while [ ! -d "$where" ]; do where=${where:h}; done
+  if [ $INSTALL = 1 ]; then app=$HOME/Applications; else app=${NUP:+${NUP:A:h}}; app=${app:-$PWD}; fi
+  while [ ! -d "$app" ]; do app=${app:h}; done
   free=$(df -k "$where" | awk 'NR==2 { print int($4 / 1048576) }')
-  [ "$free" -ge $MIN_FREE_GB ] || miss+=("$MIN_FREE_GB GB of free disk space at $where (free: $free GB)")
+  if [ "$(df -k "$where" | awk 'NR==2 { print $1 }')" = "$(df -k "$app" | awk 'NR==2 { print $1 }')" ]; then   # one volume for both: add the two needs
+    [ "$free" -ge $((MIN_FREE_GB + APP_FREE_GB)) ] || miss+=("$((MIN_FREE_GB + APP_FREE_GB)) GB of free disk space at $where for the work folder and the app (free: $free GB); or use --no-install to build the app next to the .nup file")
+  else
+    [ "$free" -ge $MIN_FREE_GB ] || miss+=("$MIN_FREE_GB GB of free disk space at $where (free: $free GB)")
+    free=$(df -k "$app" | awk 'NR==2 { print int($4 / 1048576) }')
+    [ "$free" -ge $APP_FREE_GB ] || miss+=("$APP_FREE_GB GB of free disk space for the app at $app (free: $free GB); or use --no-install to build it next to the .nup file")
+  fi
   if [ ${#miss} -gt 0 ]; then print "Missing:"; for v in $miss; do print -r -- "  - $v"; done; return 1; fi
   print "Requirements: all found"
 }
@@ -118,7 +141,31 @@ make_tree() {
   print "engine source ready: $TREE"
 }
 
+make_venv() {   # the build's Python packages in $TREE/.venv, made with $PY
+  local v=$TREE/.venv chk='import sys, lz4.block, capstone, fontTools, zbic
+if sys.version_info < (3, 14): import backports.zstd'
+  if [ -x "$v/bin/python3" ] && "$v/bin/python3" -c "$chk" 2>/dev/null; then print "python packages: ready ($v)"; return 0; fi
+  "$PY" -m venv --clear "$v" || die "cannot make the Python environment at $v with $PY"   # --clear: a broken one is made again
+  "$v/bin/python3" -m pip install -q lz4 "capstone>=5,<6" fonttools zbic 'backports.zstd; python_version < "3.14"' \
+    || die "cannot install the build's Python packages (see the pip output above); check the internet connection and run setup.sh again"
+  print "python packages: installed into $v"
+}
+
+# OotM1's patches change the translator's source; a dotnet build never gives the fingerprints of the one the lock was made with (engine AGENTS.md), so each machine builds its own and records it.
+make_translator() {   # the shader translator built from the patched source and recorded in the lock
+  local py=$TREE/.venv/bin/python3 lock=dm/gfx/tools/tool_lock.py
+  if ( cd "$TREE" && "$py" $lock --check-tools > /dev/null 2>&1 ); then print "shader translator: matches the lock"; return 0; fi
+  print "shader translator: building it from the patched source (dotnet publish, about a minute the first time)"
+  ( cd "$TREE" && dotnet publish dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj -c Release -r osx-arm64 --self-contained false -o dm/gfx/tools/dmsh_xlate_bin -nologo -v quiet ) \
+    || die "cannot build the shader translator with dotnet (see above); check that the .NET SDK 10 is installed: brew install --cask dotnet-sdk"
+  ( cd "$TREE" && "$py" $lock --update-lock > /dev/null ) || die "cannot record the shader translator in the lock"
+  ( cd "$TREE" && "$py" $lock --check-tools > /dev/null 2>&1 ) || die "the shader translator still does not match the lock after a rebuild"
+  print "shader translator: built and recorded in the lock"
+}
+
+if [ $VENV_ONLY = 1 ]; then find_python || die "Python 3.12 or newer for arm64: brew install python@3.14 (or set OOTM1_PYTHON to one)"; make_venv; exit 0; fi
 if [ $TREE_ONLY = 1 ]; then command -v git > /dev/null || die "git is missing: xcode-select --install"; make_tree; exit 0; fi
+if [ $TRANSLATOR_ONLY = 1 ]; then find_python || die "Python 3.12 or newer for arm64: brew install python@3.14 (or set OOTM1_PYTHON to one)"; make_tree; make_venv; make_translator; exit 0; fi
 if [ $CHECK_ONLY = 1 ]; then check_requirements; exit $?; fi
 [ -n "$NUP" ] || { usage; exit 1; }
 [ -f "$NUP" ] || die "no file at $NUP"
@@ -126,8 +173,10 @@ NUP=${NUP:A}
 check_requirements || die "install what is missing, then run setup.sh again"
 pgrep -f "$APP_NAME/Contents/MacOS/" > /dev/null && die "the game is running: quit it first"
 make_tree
+make_venv
+make_translator
 if [ $INSTALL = 1 ]; then OUT=$HOME/Applications/$APP_NAME; mkdir -p "$HOME/Applications"; else OUT=${NUP:h}/$APP_NAME; fi
-args=("$NUP" --platform mac-app --allow-damaged --seen-shaders --progress lines -o "$OUT")
+args=("$NUP" --platform mac-app --allow-damaged --progress lines -o "$OUT")
 [ -n "$WORK" ] && args+=(--work-dir "${WORK:A}")
-( cd "$TREE" && python3 scripts/build_ipa_from_nsp.py "${args[@]}" )
+( cd "$TREE" && PATH="$TREE/.venv/bin:$PATH" "$TREE/.venv/bin/python3" scripts/build_ipa_from_nsp.py "${args[@]}" ) || die "the build stopped: the [RED] lines above say why; each step's full log is in the work folder's logs/ folder"
 print "app: $OUT"
