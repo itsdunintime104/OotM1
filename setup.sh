@@ -146,7 +146,8 @@ make_venv() {   # the build's Python packages in $TREE/.venv, made with $PY
 if sys.version_info < (3, 14): import backports.zstd'
   if [ -x "$v/bin/python3" ] && "$v/bin/python3" -c "$chk" 2>/dev/null; then print "python packages: ready ($v)"; return 0; fi
   "$PY" -m venv --clear "$v" || die "cannot make the Python environment at $v with $PY"   # --clear: a broken one is made again
-  "$v/bin/python3" -m pip install -q lz4 "capstone>=5,<6" fonttools zbic 'backports.zstd; python_version < "3.14"' \
+  # pinned to the versions the 14 Nov build was tested with; backports.zstd (Python before 3.14 only) was not part of that test
+  "$v/bin/python3" -m pip install -q lz4==4.4.5 capstone==5.0.9 fonttools==4.68.0 zbic==1.0.1.post1 'backports.zstd; python_version < "3.14"' \
     || die "cannot install the build's Python packages (see the pip output above); check the internet connection and run setup.sh again"
   print "python packages: installed into $v"
 }
