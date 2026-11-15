@@ -32,39 +32,73 @@ This project is not affiliated with or endorsed by Nintendo.
 - A Mac with Apple silicon. Tuned and measured on an M1 Max (32 GB). Other chips work, at their own speed.
 - macOS 26.6 or later
 - Xcode 27.2, with its Metal toolchain
-- Homebrew, with `xcodegen`, `zstd`, `glslang` and the .NET SDK
-- Python 3.12 or newer (arm64)
-- Your own `.nup` file of the game, with the same update as the tested build (another update may not work)
-- About 80 GB of free disk space for the first build (the extracted game and the shader cache are kept for the next build)
+- Homebrew, with `xcodegen`, `zstd`, `glslang`, Python 3.12 or newer and the .NET SDK 10. The .NET SDK builds the shader translator: OotM1's patches change its source, so `setup.sh` builds it on your Mac.
+- Your own `.nup` file of the game, with the same update as the tested build (update 131072; another update may not work)
+- Free disk space: about 80 GB for the work folder (the extracted game and the shader cache, kept for the next build) and about 40 GB for the app (it is about 35 GB). By default the work folder is next to the `.nup` file and the app goes to `/Applications`. `setup.sh --check` tells you if there is not enough.
 
 ## Install
 
-1. Install Xcode 27.2 and select it, then its Metal toolchain:
+1. Install Xcode 27.2 from the App Store or developer.apple.com, open it once, then select it and add its Metal toolchain:
    ```sh
    sudo xcode-select -s /Applications/Xcode.app
    xcodebuild -downloadComponent MetalToolchain
    ```
-2. Install the tools:
+2. Install the tools with [Homebrew](https://brew.sh):
    ```sh
-   brew install xcodegen zstd glslang python
+   brew install xcodegen zstd glslang python@3.14
    brew install --cask dotnet-sdk
    ```
-3. Get this repository and run the setup script with your `.nup` file:
+3. Get this repository and check your Mac:
    ```sh
    git clone https://github.com/itsdunintime104/OotM1.git
    cd OotM1
-   ./setup.sh ~/Games/game.nup
+   ./setup.sh ~/Games/game.nup --check
    ```
-4. Open **OotM1** from `~/Applications`.
+   It prints the Python it will use and `Requirements: all found`, or a list of what is missing with the command that installs each item.
+4. Connect the power adapter and build. `caffeinate -i` keeps the Mac awake until the build ends:
+   ```sh
+   caffeinate -i ./setup.sh ~/Games/game.nup
+   ```
+5. When it prints `app: /Applications/The Legend of Zelda - Ocarina of Time.app`, open **The Legend of Zelda - Ocarina of Time** from Applications or Launchpad. The app goes into `/Applications`, so build with an administrator account (or use `--no-install`). A build made before 15 Nov is at `~/Applications/OotM1.app`: move it to the Trash.
 
-`setup.sh` checks your Mac, downloads the engine at the pinned commit, applies the patches, builds the app from your `.nup` file and installs it. The first build takes 1 to 2 hours, most of it shader compilation. It never changes your `.nup` file.
+`setup.sh` never changes your `.nup` file. If the `.nup` file or the work folder is on an external drive, keep the drive connected until the build ends.
+
+### What the build does, and how long it takes
+
+Measured on an M1 Max on 14 Nov, with the `.nup` file and the work folder on a USB hard disk. The first build takes about 5 hours there; an SSD is faster. Most of it is step 4.
+
+| Step | First build | Next builds |
+|---|---|---|
+| Engine source, Python packages (in `engine/.venv`) and shader translator | about 5 min | under 1 min |
+| [1] Unpack the game, then check its files | about 30 min | about 3 min (only the check) |
+| [2] Rewrite the game's code | about 1 min | reused |
+| [3] Shader split: 42,848 shaders | about 16 min | about 16 min (a split made with damaged game files is never reused) |
+| [4] Mac shaders: translate and compile all of them, then write the library | about 3 h (measured: 26,784 shaders in 1 h 43 min, then 19 min to write the 6.6 GB library) | only the changed ones |
+| [5] Mac host | under 1 min | under 1 min |
+| [6] Pipeline archive for your GPU | about 46 min (3.8 GB) | only when its inputs changed |
+| [7] Copy the game files into the app and sign it | about 14 min | about 14 min |
+
+Each step prints a progress line every 30 seconds with its own time estimate. A step whose inputs did not change says `reused (inputs unchanged)`.
+
+### Messages you will see
+
+| Message | What it means |
+|---|---|
+| `python packages: installed into …/engine/.venv` | The first run made a Python environment for the build. Your own Python is not changed. |
+| `shader translator: building it from the patched source` | Normal at every run. It takes a few seconds. |
+| `[RED] … 3 file(s) whose bytes do not start as their names promise` | The tested game files have 3 damaged textures (a Fairy Fountain floor, a Ganon stage texture, a Water Temple gate). The build packs them as they are and goes on. |
+| `setup.sh: no file at …` | The `.nup` file is not at that path. If it is on an external drive, check that the drive is connected (Finder shows it). |
+| `setup.sh: the build stopped: …` | A step failed. The `[RED]` lines above it say why, and the step's full log is in the work folder's `logs/` folder. Fix the cause and run the same command again: the finished steps are reused. |
+
+### Options
 
 | Option | Effect |
 |---|---|
 | `--check` | Only check the requirements |
 | `--tree <dir>` | Use this folder for the engine source (default `./engine`) |
 | `--work <dir>` | Use this folder for the extracted game and the shader cache (default next to the `.nup` file) |
-| `--no-install` | Build the app next to the `.nup` file instead of in `~/Applications` |
+| `--no-install` | Build the app next to the `.nup` file instead of in `/Applications` |
+| `--hud-msl-only` | After a build: write the HUD shader sources for frame generation again, adding the HUD shaders the last game logs name (see [Frame generation](#frame-generation)) |
 
 After a build, `tools/check_run.sh <app>` starts the game, goes in through the menus, takes a screenshot and reads the log. It prints PASS or FAIL.
 
@@ -91,6 +125,12 @@ Three host settings are on by default and have no row:
 - the async compute window (`DM_NVN_ASYNC_CS=1`): runs some of the game's compute work beside its draw passes
 - freed-texture IDs get a placeholder (`DM_NVN_POOL_RETIRED=1`): fixes the long slowdowns after scene changes (see [Status](#status))
 
+### Frame generation
+
+Frame generation draws the HUD on a layer of its own, so that generated frames come from the 3D picture alone. For that the game needs the source of each HUD shader, and the app carries compiled shaders only. At the end of each build, `setup.sh` writes the sources of the HUD shaders listed in `tools/hud_shaders.txt` to `~/Library/Application Support/nxnative/0400486024DEC000/mfx_msl/`, and adds four lines to `env.txt` in that folder: the sources' folder and the game's camera and depth settings. It does not change a line you already set; it tells you when one differs.
+
+A frame whose HUD uses a shader without a source gets no generated frame, so frame generation pauses there. If the log names a fragment shader with `no MSL source`, run `./setup.sh <file.nup> --hud-msl-only` (with the same `--work` folder, if you gave one). It adds the HUD shaders that the last game logs name. No rebuild is needed: start the game again.
+
 ## Performance
 
 MacBook Pro 16-inch, M1 Max, 32 GB, macOS 26.6, power adapter connected, High Power mode, windowed, Kokiri Forest, the defaults above:
@@ -107,27 +147,39 @@ The GPU is the limit at this resolution. The work behind these numbers, includin
 
 ## Status
 
-Playable. The numbers above come from the test build this repository reproduces: `setup.sh --tree-only` gives its engine source exactly (checked on 12 Nov), plus the 6 default settings of `patches/90-m1max-defaults.diff`. A full build through `setup.sh` has not been run yet.
+Playable. The numbers above come from the test build this repository reproduces: `setup.sh --tree-only` gives its engine source exactly (checked on 12 Nov), plus the 6 default settings of `patches/90-m1max-defaults.diff`. On 14 Nov a full build through `setup.sh` on an M1 Max passed `tools/check_run.sh`: 60 frames a second at the start and no missing shaders.
 
 Fixed on 12 Nov (`patches/24-scene-changes-and-movie.diff`):
 
 - **Long slowdowns after scene changes.** After a scene change the host looked up thousands of texture slots a frame that point at textures the game had already freed. A small table overflowed, and the host rebuilt its texture table every frame: 29 to 69 ms of CPU a frame, for up to 15 s. The game never reads such a slot, so the host now gives it a placeholder. In the test runs the worst host CPU time a frame fell from 68.7 ms to 8.3 ms. On by default.
 - **Laggy opening movie.** The movie is AV1, which the M1 decodes on the CPU. A slow picture (up to 132 ms) held the game's movie thread, so the movie stopped on one picture. Decoding now runs on its own thread. Pauses over 50 ms fell from 31 to 55 to 1 to 6 per 600 pictures, and the tester called it great.
 
+### In the test build, not yet in these patches (13 Nov)
+
+The work below runs in the test build. It is not in `patches/` yet, so `setup.sh` does not build it.
+
+- **Frame generation pacing.** With frame generation on, the frame rate swung between about 70 and 30 frames a second. The host counted the frame generation's GPU time wrongly, so it held frames it did not need to hold. It now counts the frame generation's measured work, and the time the GPU is busy rather than the sum of buffers that overlap. In Hyrule Field the result was a steady 30 + 30, with no hold changes (17 to 30 before). The tester found that locked rate choppy and preferred the variable one, so holding stays a setting.
+- **Real-time game speed below 60.** The game's time step now follows the measured frame time, not whole 1/60 s steps. In Hyrule Field with frame generation on, game time ran at 0.97 to 0.99 of real time at about 43 real frames a second. Off by default.
+- **Smaller host fixes.** Queue work held back at loads now runs on the encode thread, not on the game's thread. Shared textures that nothing has used for 600 submissions are released.
+- **Measured: Hyrule Field's grass is limited by the GPU.** A frame's GPU work spans 15.6 to 17.8 ms, and the GPU is idle for about 5 ms of it. The cause of that idle time is not found yet. A steady 60 + 60 with frame generation needs about 5 ms less GPU time per real frame.
+
 Known faults:
 
 - **Freezes at the first visit to a place**, up to about 0.7 s. The host builds a new pipeline while the frame waits. The second visit does not freeze. A fix that builds them before the first frame is in patch 24, but it needs two lists made from your own game files, which this repository does not ship (`DM_NVN_MESH_SETS`, `DM_NVN_LIB_TWINS`). Without the lists it does nothing.
 - **Hitches of 40 to 200 ms**, where the GPU stops between two frames that are ready. They come with memory pressure: with browsers and chat apps closed, they fell from 4.4 to 0.2 to 0.4 per 1,000 frames. This is a strong sign, not a proof.
-- **Below 60 in the city.** The heaviest places are limited by the GPU. Measuring them is the next step.
+- **Below 60 in the city and in Hyrule Field's grass.** These places are limited by the GPU (see above).
 - **A white glow on some textures in the city**, seen by the tester. The cause is not found yet.
-- Below 60 the game moves in whole steps of 1/60 s, so motion can speed up and slow down.
-- Frame generation is experimental.
+- Below 60 the game moves in whole steps of 1/60 s, so motion can speed up and slow down. The test build fixes this (see above).
+- Frame generation is experimental. Its frame rate can swing between about 70 and 30. The test build fixes this (see above).
 - Above 60 frames a second is not possible yet: the game's time step is handed over in whole 1/60 s steps.
 
 ## Troubleshooting
 
-- **`setup.sh` stops at the check.** It names what is missing and how to install it.
-- **macOS will not open the app.** Sign it once: `codesign -f -s - ~/Applications/OotM1.app` (takes a few minutes).
+- **`setup.sh` stops at the check.** It names what is missing and the command that installs it. Install it and run the same command again.
+- **The build stops.** The `[RED]` lines above `setup.sh: the build stopped` say why. Each step's full log is in the work folder's `logs/` folder. Run the same command again after the fix: the finished steps are reused.
+- **`Device not configured` or `database disk image is malformed`.** The external drive with the work folder disconnected during the build. Connect it straight to the Mac (no hub), and run the same command again. A damaged shader cache is made anew, so step 4 starts over.
+- **The Mac went to sleep and the build stopped.** Start it with `caffeinate -i` in front, as in the install steps.
+- **macOS will not open the app.** Sign it once: `codesign -f -s - "/Applications/The Legend of Zelda - Ocarina of Time.app"` (takes a few minutes).
 - **Low frame rate.** Connect the power adapter and set High Power mode (System Settings → Battery). Close other apps that use the GPU.
 - **Hitches.** Close browsers, chat apps and other apps that use a lot of memory. The game uses up to 16 GB of GPU memory in the city, and on a 32 GB Mac the rest can push it into swap.
 - **The log.** The game's log is in `~/Library/Logs/nxnative/`, replaced at each start; the run before is kept as `.prev.log`.
@@ -138,6 +190,16 @@ Known faults:
 - `patches/23-test-tree-local-edits.diff` and `patches/24-scene-changes-and-movie.diff` hold the M1 Max work. Patch 24 also adds diagnostics to the log: `DM_NVN_GPUPROF=slow:<ms>` prints the per-pass GPU times of frames that take at least that long, a `[paging]` line reports swap and page-ins, and the movie decoder reports its pauses every 600 pictures.
 - `patches/90-m1max-defaults.diff` holds the default settings above.
 - Each host change can be switched with its environment variable in `env.txt`, in the game's folder under `~/Library/Application Support/nxnative/`, one `NAME=value` per line.
+
+### Rebuild after a change
+
+- **New patches from this repository.** Run `git pull`, then run `./setup.sh` again with the same `.nup` file and the same options (the same `--work` folder, if you gave one). The build reuses the extracted game and the shader cache, and skips the steps whose inputs did not change.
+- **Your own change to the engine.** `setup.sh` resets `engine/` to the pinned commit and applies `patches/series` again, so a change made in `engine/` is lost at the next run. Save it as a patch first:
+  ```sh
+  git -C engine diff > patches/25-my-change.diff
+  ```
+  Then add `25-my-change.diff` to `patches/series`, above `90-m1max-defaults.diff`, and run `./setup.sh` again. `git diff` holds only your change, because `setup.sh` stages the patches it applies.
+- **Settings only.** A change to `env.txt` needs no rebuild. It applies at the next start of the game.
 
 ## Credits
 

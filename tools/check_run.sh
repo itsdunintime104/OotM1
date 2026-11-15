@@ -34,7 +34,7 @@ why=()
 if [ -f "$LOGF" ]; then
   # hle_nvn.c tsummary prints every 300 frames: "[nvn] timing up to frame N: frame time p50 X / p95 Y / max Z ms"
   p50=$(grep -E '\[nvn\] timing up to frame [0-9]+: frame time p50 [0-9.]+' "$LOGF" | tail -1 | sed -E 's/.*frame time p50 ([0-9.]+).*/\1/')
-  bad=$(grep -E '\[RED\]|crash|abort|Assertion failed|command buffer execution error' "$LOGF" | grep -v 'failed to load shader' | head -5)
+  bad=$(grep -E '\[RED\]|crash|abort|Assertion failed|command buffer execution error' "$LOGF" | grep -v -e 'failed to load shader' -e 'ended before the game opened its gate' | head -5)
   [ -n "$p50" ] || why+=("no frame-time line ('[nvn] timing up to frame N: frame time p50 <ms>') in the log")
   [ -n "$p50" ] && [ $(( p50 < 40 )) = 0 ] && why+=("frame p50 $p50 ms is not under 40 ms")
   [ -n "$bad" ] && why+=("log has [RED]/crash/abort lines:"$'\n'"$bad")

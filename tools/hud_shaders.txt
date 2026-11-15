@@ -1,0 +1,32 @@
+# The game's HUD shaders: fragment shaders the host draws into the UI layer when frame generation is on.
+# Frame generation needs their MSL (DM_MFX_MSL_DIR); setup.sh exports it from the build's shader cache.
+# One shader key per line, collected from the test logs of 12 to 15 Nov.
+# setup.sh also adds the keys that the last game logs name in "no MSL source" lines.
+0810c438f79a162e
+09ab31c69af710c9
+1a42d67ae0db7474
+22a1cef53d587c3f
+29e3c9dd92b8a571
+2d9525b195594045
+2f9948fcc9c860a7
+38482ed8c9a14589
+441755c4f41d54e0
+5400345cd495de75
+5aa99138a9c8e2ca
+5e297f00844da41a
+613047bad614c1ee
+721839834984d56a
+737f112b96d2cc42
+76c087727e5c3878
+91227858ac73a2cc
+97fc09f6760444e7
+b489eb834e0a0b65
+b998f78a92860333
+bbec88c9a94348a3
+bcbb4f059c2657d6
+c2752334bef0445a
+c471eeb4f83f8051
+ca956721c32b75d2
+d534f6881b5c877e
+e5d10f6240ec7762
+ed6ec151286be3b8
