@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Builds OotM1 (Switch 2) as a Mac app with the patches of this repository.
-# Usage: ./setup.sh <file.nup> [--check] [--tree <dir>] [--work <dir>] [--no-install]
+# Usage: ./setup.sh <file.nup> [--check] [--tree <dir>] [--work <dir>] [--no-install] [--hud-msl-only]
 set -e
 autoload -Uz is-at-least
 
@@ -10,23 +10,27 @@ BASE=04811a634b7f9344e882129b0973dd493369dd62
 APP_NAME="The Legend of Zelda - Ocarina of Time.app"   # a file name cannot hold ':'; the name inside the app is "The Legend of Zelda: Ocarina of Time"
 APP_DIR=/Applications
 OLD_APP=$HOME/Applications/OotM1.app   # where builds before 15 Nov went
+TITLE_ID=0400486024DEC000
+SUPPORT="$HOME/Library/Application Support/nxnative/$TITLE_ID"   # the game's own folder: save, env.txt, and the HUD shader sources for frame generation
+GAME_LOG=$HOME/Library/Logs/nxnative/$TITLE_ID.log
 MIN_FREE_GB=80
 APP_FREE_GB=40                    # the app is about 35 GB
 ROWS_COMMENT="# Rows below from seedds/nxnative#1732 (40,154 entries regenerated on main, recorded through Kokiri Forest, the Great Deku Tree, Hyrule Field, Kakariko Village, Dodongo's Cavern, Zora's Domain, Jabu-Jabu's Belly and the Forest Temple), those not already listed above."
 
 usage() {
   cat <<'EOF'
-usage: ./setup.sh <file.nup> [--check] [--tree <dir>] [--work <dir>] [--no-install]
+usage: ./setup.sh <file.nup> [--check] [--tree <dir>] [--work <dir>] [--no-install] [--hud-msl-only]
   --check         only check the requirements
   --tree <dir>    folder for the engine source (default ./engine)
   --work <dir>    folder for the extracted game and the shader cache (default: next to the .nup file)
   --no-install    build the app next to the .nup file, not in /Applications
+  --hud-msl-only  after a build: write frame generation's HUD shader sources again, adding those the last game logs name
 EOF
 }
 die() { print -u2 -- "setup.sh: $*"; exit 1; }
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
-NUP= CHECK_ONLY=0 TREE=$PWD/engine WORK= INSTALL=1 TREE_ONLY=0 VENV_ONLY=0 TRANSLATOR_ONLY=0 DEFAULTS=1 PY= PYV=
+NUP= CHECK_ONLY=0 TREE=$PWD/engine WORK= INSTALL=1 TREE_ONLY=0 VENV_ONLY=0 TRANSLATOR_ONLY=0 HUD_ONLY=0 DEFAULTS=1 PY= PYV=
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) CHECK_ONLY=1 ;;
@@ -37,6 +41,7 @@ while [ $# -gt 0 ]; do
     --venv-only) VENV_ONLY=1 ;;      # not in the usage: make the Python environment only
     --translator-only) TRANSLATOR_ONLY=1 ;;   # not in the usage: make the engine source, the Python environment and the shader translator only
     --no-defaults) DEFAULTS=0 ;;     # not in the usage: leave out 90-m1max-defaults.diff
+    --hud-msl-only) HUD_ONLY=1 ;;
     -h|--help) usage; exit 0 ;;
     -*) usage; die "unknown option $1" ;;
     *) [ -z "$NUP" ] || die "one .nup file only"; NUP=$1 ;;
@@ -169,10 +174,37 @@ make_translator() {   # the shader translator built from the patched source and 
   print "shader translator: built and recorded in the lock"
 }
 
+# Frame generation draws the HUD on a layer of its own: the host compiles a copy of each HUD shader from its MSL, which the app does not carry.
+# The sources come from the build's shader cache (tools/export_hud_msl.py), and env.txt names their folder (DM_MFX_MSL_DIR). A failure here leaves the game as it is.
+make_hud_msl() {
+  local work=${WORK:+${WORK:A}} dest=$SUPPORT/mfx_msl
+  work=${work:-${NUP:h}/${TITLE_ID}_build}
+  if [ ! -f "$work/shader/cache/cas.db" ]; then print "frame generation: no shader cache at $work/shader/cache: HUD shader sources not written"; return 0; fi
+  DM_GAME=$TITLE_ID "$TREE/.venv/bin/python3" "$HERE/tools/export_hud_msl.py" "$TREE" "$work/shader/cache/cas.db" "$HERE/tools/hud_shaders.txt" "$dest" "$GAME_LOG" "${GAME_LOG:r}.prev.log" \
+    || { print "frame generation: the HUD shader sources could not be written (see above); the game runs, but frame generation makes no frames"; return 0; }
+  mkdir -p "$SUPPORT"
+  env_line DM_MFX_MSL_DIR "$dest" "the HUD shader sources"
+  env_line DM_MFX_CAMERA vertex:0:13568 "the game's camera block (vertex uniform slot 0, 13568 bytes), measured with the host's DM_MFX_PROBE"
+  env_line DM_MFX_SCENE_FIRST 1 "the 3D scene is the first pass of a frame"
+  env_line DM_MFX_DEPTH 1:1000 "the depth range (near 1, far 1000)"
+}
+
+env_line() {   # NAME VALUE WHY: adds NAME=VALUE to env.txt when env.txt does not set NAME; names a different value without changing it
+  local envf=$SUPPORT/env.txt have
+  have=$(sed -n "s/^$1=//p" "$envf" 2>/dev/null | head -1)   # empty when env.txt or the line is not there
+  if [ -z "$have" ]; then { print "# Frame generation: $3 (written by setup.sh)"; print -r -- "$1=$2"; } >> "$envf"; print "frame generation: $1 added to $envf"
+  elif [ "$have" != "$2" ]; then print "frame generation: $envf sets $1=$have, not $2; frame generation may make no frames with it"; fi
+}
+
 if [ $VENV_ONLY = 1 ]; then find_python || die "Python 3.12 or newer for arm64: brew install python@3.14 (or set OOTM1_PYTHON to one)"; make_venv; exit 0; fi
 if [ $TREE_ONLY = 1 ]; then command -v git > /dev/null || die "git is missing: xcode-select --install"; make_tree; exit 0; fi
 if [ $TRANSLATOR_ONLY = 1 ]; then find_python || die "Python 3.12 or newer for arm64: brew install python@3.14 (or set OOTM1_PYTHON to one)"; make_tree; make_venv; make_translator; exit 0; fi
 if [ $CHECK_ONLY = 1 ]; then check_requirements; exit $?; fi
+if [ $HUD_ONLY = 1 ]; then   # the engine source and its Python environment as the last build left them; the work folder from --work or the .nup's folder
+  [ -n "$NUP$WORK" ] || die "--hud-msl-only needs the .nup file or --work, to find the work folder"
+  [ -x "$TREE/.venv/bin/python3" ] || die "no engine source with its Python environment at $TREE: run a full build first"
+  NUP=${NUP:+${NUP:A}}; make_hud_msl; exit 0
+fi
 [ -n "$NUP" ] || { usage; exit 1; }
 [ -f "$NUP" ] || die "no file at $NUP"
 NUP=${NUP:A}
@@ -185,5 +217,6 @@ if [ $INSTALL = 1 ]; then OUT=$APP_DIR/$APP_NAME; else OUT=${NUP:h}/$APP_NAME; f
 args=("$NUP" --platform mac-app --allow-damaged --progress lines -o "$OUT")
 [ -n "$WORK" ] && args+=(--work-dir "${WORK:A}")
 ( cd "$TREE" && PATH="$TREE/.venv/bin:$PATH" "$TREE/.venv/bin/python3" scripts/build_ipa_from_nsp.py "${args[@]}" ) || die "the build stopped: the [RED] lines above say why; each step's full log is in the work folder's logs/ folder"
+make_hud_msl
 print "app: $OUT"
 if [ -d "$OLD_APP" ]; then print "An older build is still at $OLD_APP. It is not used any more: move it to the Trash to free about 35 GB."; fi

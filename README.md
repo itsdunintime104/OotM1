@@ -98,6 +98,7 @@ Each step prints a progress line every 30 seconds with its own time estimate. A 
 | `--tree <dir>` | Use this folder for the engine source (default `./engine`) |
 | `--work <dir>` | Use this folder for the extracted game and the shader cache (default next to the `.nup` file) |
 | `--no-install` | Build the app next to the `.nup` file instead of in `/Applications` |
+| `--hud-msl-only` | After a build: write the HUD shader sources for frame generation again, adding the HUD shaders the last game logs name (see [Frame generation](#frame-generation)) |
 
 After a build, `tools/check_run.sh <app>` starts the game, goes in through the menus, takes a screenshot and reads the log. It prints PASS or FAIL.
 
@@ -123,6 +124,12 @@ Three host settings are on by default and have no row:
 - the 120 Hz display link (`DM_PRESENT_LINK=2`)
 - the async compute window (`DM_NVN_ASYNC_CS=1`): runs some of the game's compute work beside its draw passes
 - freed-texture IDs get a placeholder (`DM_NVN_POOL_RETIRED=1`): fixes the long slowdowns after scene changes (see [Status](#status))
+
+### Frame generation
+
+Frame generation draws the HUD on a layer of its own, so that generated frames come from the 3D picture alone. For that the game needs the source of each HUD shader, and the app carries compiled shaders only. At the end of each build, `setup.sh` writes the sources of the HUD shaders listed in `tools/hud_shaders.txt` to `~/Library/Application Support/nxnative/0400486024DEC000/mfx_msl/`, and adds four lines to `env.txt` in that folder: the sources' folder and the game's camera and depth settings. It does not change a line you already set; it tells you when one differs.
+
+A frame whose HUD uses a shader without a source gets no generated frame, so frame generation pauses there. If the log names a fragment shader with `no MSL source`, run `./setup.sh <file.nup> --hud-msl-only` (with the same `--work` folder, if you gave one). It adds the HUD shaders that the last game logs name. No rebuild is needed: start the game again.
 
 ## Performance
 
