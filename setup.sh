@@ -7,9 +7,11 @@ autoload -Uz is-at-least
 HERE=${0:A:h}; PATCHES=$HERE/patches
 REPO_URL=https://github.com/seedds/nxnative.git
 BASE=04811a634b7f9344e882129b0973dd493369dd62
-APP_NAME="OotM1.app"
+APP_NAME="The Legend of Zelda - Ocarina of Time.app"   # a file name cannot hold ':'; the name inside the app is "The Legend of Zelda: Ocarina of Time"
+APP_DIR=/Applications
+OLD_APP=$HOME/Applications/OotM1.app   # where builds before 15 Nov went
 MIN_FREE_GB=80
-APP_FREE_GB=40                    # the app is about 32 GB
+APP_FREE_GB=40                    # the app is about 35 GB
 ROWS_COMMENT="# Rows below from seedds/nxnative#1732 (40,154 entries regenerated on main, recorded through Kokiri Forest, the Great Deku Tree, Hyrule Field, Kakariko Village, Dodongo's Cavern, Zora's Domain, Jabu-Jabu's Belly and the Forest Temple), those not already listed above."
 
 usage() {
@@ -18,7 +20,7 @@ usage: ./setup.sh <file.nup> [--check] [--tree <dir>] [--work <dir>] [--no-insta
   --check         only check the requirements
   --tree <dir>    folder for the engine source (default ./engine)
   --work <dir>    folder for the extracted game and the shader cache (default: next to the .nup file)
-  --no-install    build the app next to the .nup file, not in ~/Applications
+  --no-install    build the app next to the .nup file, not in /Applications
 EOF
 }
 die() { print -u2 -- "setup.sh: $*"; exit 1; }
@@ -57,6 +59,7 @@ find_python() {   # sets PY and PYV to the first Python that is arm64 and 3.12 o
 
 check_requirements() {   # prints each missing requirement with its fix; returns 1 when one is missing
   local miss=() v where app free
+  [ -z "$NUP" ] || [ -f "$NUP" ] || miss+=("the .nup file at $NUP (not found; if it is on an external drive, connect the drive)")
   [ "$(uname -m)" = arm64 ] || miss+=("a Mac with Apple silicon (this one is $(uname -m))")
   v=$(sw_vers -productVersion 2>/dev/null)
   is-at-least 26.6 "$v" || miss+=("macOS 26.6 or later (this Mac has $v): update macOS in System Settings")
@@ -72,10 +75,12 @@ check_requirements() {   # prints each missing requirement with its fix; returns
   else miss+=("Python 3.12 or newer for arm64: brew install python@3.14 (or set OOTM1_PYTHON to one)${OOTM1_PYTHON:+; OOTM1_PYTHON is $OOTM1_PYTHON, which is not one}"); fi
   where=${WORK:-${NUP:+${NUP:A:h}}}; where=${where:-$PWD}
   while [ ! -d "$where" ]; do where=${where:h}; done
-  if [ $INSTALL = 1 ]; then app=$HOME/Applications; else app=${NUP:+${NUP:A:h}}; app=${app:-$PWD}; fi
+  if [ $INSTALL = 1 ]; then app=$APP_DIR; else app=${NUP:+${NUP:A:h}}; app=${app:-$PWD}; fi
+  [ $INSTALL = 0 ] || [ -w "$APP_DIR" ] || miss+=("write access to $APP_DIR (this account is not an administrator): ask an administrator to run setup.sh, or use --no-install to build the app next to the .nup file")
   while [ ! -d "$app" ]; do app=${app:h}; done
   free=$(df -k "$where" | awk 'NR==2 { print int($4 / 1048576) }')
-  if [ "$(df -k "$where" | awk 'NR==2 { print $1 }')" = "$(df -k "$app" | awk 'NR==2 { print $1 }')" ]; then   # one volume for both: add the two needs
+  if [ -n "$NUP" ] && [ ! -f "$NUP" ]; then :   # no .nup there: the free space of the folder above it says nothing
+  elif [ "$(df -k "$where" | awk 'NR==2 { print $1 }')" = "$(df -k "$app" | awk 'NR==2 { print $1 }')" ]; then   # one volume for both: add the two needs
     [ "$free" -ge $((MIN_FREE_GB + APP_FREE_GB)) ] || miss+=("$((MIN_FREE_GB + APP_FREE_GB)) GB of free disk space at $where for the work folder and the app (free: $free GB); or use --no-install to build the app next to the .nup file")
   else
     [ "$free" -ge $MIN_FREE_GB ] || miss+=("$MIN_FREE_GB GB of free disk space at $where (free: $free GB)")
@@ -176,8 +181,9 @@ pgrep -f "$APP_NAME/Contents/MacOS/" > /dev/null && die "the game is running: qu
 make_tree
 make_venv
 make_translator
-if [ $INSTALL = 1 ]; then OUT=$HOME/Applications/$APP_NAME; mkdir -p "$HOME/Applications"; else OUT=${NUP:h}/$APP_NAME; fi
+if [ $INSTALL = 1 ]; then OUT=$APP_DIR/$APP_NAME; else OUT=${NUP:h}/$APP_NAME; fi
 args=("$NUP" --platform mac-app --allow-damaged --progress lines -o "$OUT")
 [ -n "$WORK" ] && args+=(--work-dir "${WORK:A}")
 ( cd "$TREE" && PATH="$TREE/.venv/bin:$PATH" "$TREE/.venv/bin/python3" scripts/build_ipa_from_nsp.py "${args[@]}" ) || die "the build stopped: the [RED] lines above say why; each step's full log is in the work folder's logs/ folder"
 print "app: $OUT"
+if [ -d "$OLD_APP" ]; then print "An older build is still at $OLD_APP. It is not used any more: move it to the Trash to free about 35 GB."; fi

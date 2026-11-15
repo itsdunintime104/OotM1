@@ -34,7 +34,7 @@ This project is not affiliated with or endorsed by Nintendo.
 - Xcode 27.2, with its Metal toolchain
 - Homebrew, with `xcodegen`, `zstd`, `glslang`, Python 3.12 or newer and the .NET SDK 10. The .NET SDK builds the shader translator: OotM1's patches change its source, so `setup.sh` builds it on your Mac.
 - Your own `.nup` file of the game, with the same update as the tested build (update 131072; another update may not work)
-- Free disk space: about 80 GB for the work folder (the extracted game and the shader cache, kept for the next build) and about 40 GB for the app (it is about 35 GB). By default the work folder is next to the `.nup` file and the app goes to `~/Applications`. `setup.sh --check` tells you if there is not enough.
+- Free disk space: about 80 GB for the work folder (the extracted game and the shader cache, kept for the next build) and about 40 GB for the app (it is about 35 GB). By default the work folder is next to the `.nup` file and the app goes to `/Applications`. `setup.sh --check` tells you if there is not enough.
 
 ## Install
 
@@ -59,7 +59,7 @@ This project is not affiliated with or endorsed by Nintendo.
    ```sh
    caffeinate -i ./setup.sh ~/Games/game.nup
    ```
-5. When it prints `app: …/OotM1.app`, open **OotM1** from `~/Applications`.
+5. When it prints `app: /Applications/The Legend of Zelda - Ocarina of Time.app`, open **The Legend of Zelda - Ocarina of Time** from Applications or Launchpad. The app goes into `/Applications`, so build with an administrator account (or use `--no-install`). A build made before 15 Nov is at `~/Applications/OotM1.app`: move it to the Trash.
 
 `setup.sh` never changes your `.nup` file. If the `.nup` file or the work folder is on an external drive, keep the drive connected until the build ends.
 
@@ -97,7 +97,7 @@ Each step prints a progress line every 30 seconds with its own time estimate. A 
 | `--check` | Only check the requirements |
 | `--tree <dir>` | Use this folder for the engine source (default `./engine`) |
 | `--work <dir>` | Use this folder for the extracted game and the shader cache (default next to the `.nup` file) |
-| `--no-install` | Build the app next to the `.nup` file instead of in `~/Applications` |
+| `--no-install` | Build the app next to the `.nup` file instead of in `/Applications` |
 
 After a build, `tools/check_run.sh <app>` starts the game, goes in through the menus, takes a screenshot and reads the log. It prints PASS or FAIL.
 
@@ -172,7 +172,7 @@ Known faults:
 - **The build stops.** The `[RED]` lines above `setup.sh: the build stopped` say why. Each step's full log is in the work folder's `logs/` folder. Run the same command again after the fix: the finished steps are reused.
 - **`Device not configured` or `database disk image is malformed`.** The external drive with the work folder disconnected during the build. Connect it straight to the Mac (no hub), and run the same command again. A damaged shader cache is made anew, so step 4 starts over.
 - **The Mac went to sleep and the build stopped.** Start it with `caffeinate -i` in front, as in the install steps.
-- **macOS will not open the app.** Sign it once: `codesign -f -s - ~/Applications/OotM1.app` (takes a few minutes).
+- **macOS will not open the app.** Sign it once: `codesign -f -s - "/Applications/The Legend of Zelda - Ocarina of Time.app"` (takes a few minutes).
 - **Low frame rate.** Connect the power adapter and set High Power mode (System Settings → Battery). Close other apps that use the GPU.
 - **Hitches.** Close browsers, chat apps and other apps that use a lot of memory. The game uses up to 16 GB of GPU memory in the city, and on a 32 GB Mac the rest can push it into swap.
 - **The log.** The game's log is in `~/Library/Logs/nxnative/`, replaced at each start; the run before is kept as `.prev.log`.
