@@ -97,7 +97,7 @@ M1 Max, 32 GB, power adapter, High Power mode, defaults:
 | Kokiri Forest | 16.6 to 16.7 ms (60 fps) | |
 | Castle Town market (heaviest) | 16.6 to 18.4 ms | 18.3 to 22 ms |
 
-The GPU is the limit at this resolution. Details, including what did not help: [docs/results.md](docs/results.md).
+The GPU is the limit at this resolution. Details, including what did not help: [docs/results.md](docs/results.md). Every experiment, one row each: [docs/experiments.md](docs/experiments.md).
 
 ## Known faults
 

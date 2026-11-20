@@ -1,6 +1,6 @@
 # OotM1: state of the test work on an M1 Max
 
-Status on 2026-11-11, with the results of 12 Nov added in "Results of 12 Nov: scene changes, the opening movie and the city". The results of 17 to 19 Nov are in their own section and describe the branch `experimental`. This page describes a private test tree, not the released app. Most of the settings named here are not in this repository's `main` yet. The table in "What the test tree holds" says which.
+Status on 2026-11-11, with the results of 12 Nov added in "Results of 12 Nov: scene changes, the opening movie and the city". The results of 17 to 19 Nov are in their own section and describe the branch `experimental`. A list of everything that was tried, one row each, is in [experiments.md](experiments.md). This page describes a private test tree, not the released app. Most of the settings named here are not in this repository's `main` yet. The table in "What the test tree holds" says which.
 
 - Game: Ocarina of Time (Switch 2).
 - Machine: MacBook Pro with M1 Max, 32 GB, 120 Hz variable refresh screen, macOS 26.6.
