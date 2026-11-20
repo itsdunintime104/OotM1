@@ -7,7 +7,8 @@
 -DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX	game	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler
 +DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX	metalfx	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler
  DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
- DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
+-DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
++DM_FULLSCREEN	choice	0=Window,1=Fullscreen	1	platform:mac	Game	Display mode		level=basic
 -DM_OUTPUT_HEIGHT	choice	0=Screen's own,1440=2560 × 1440,1080=1920 × 1080	0	platform:mac	Game	Fullscreen resolution	The picture is drawn at this size and the screen scales it up: less GPU time, a softer picture.	level=basic
 +DM_OUTPUT_HEIGHT	choice	0=Screen's own,1440=2560 × 1440,1080=1920 × 1080	1440	platform:mac	Game	Fullscreen resolution	The picture is drawn at this size and the screen scales it up: less GPU time, a softer picture.	level=basic
  DM_MFX_INTERP	choice	0=Off,interp30=30 + 30,interpmax=Uncapped	0	platform:mac	Game	Frame generation	MetalFX makes one frame between two game frames. 30 + 30 holds the game at 30 frames a second; Uncapped keeps the frame rate setting. Experimental.	level=basic

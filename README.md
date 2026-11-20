@@ -75,6 +75,7 @@ The settings window opens when the app starts. Defaults (measured best on the M1
 | Frame rate | 60 | the game's own target |
 | Render scale | 1.0 | 0.75 is faster but visibly softer |
 | Game's upscaler | MetalFX | replaces a compute chain that costs 3.2 ms a frame |
+| Display mode | Fullscreen | in a window macOS draws the picture again: the Castle Town market fell from 60 to about 55 fps |
 | Fullscreen resolution | 2560 × 1440 | the size the game composes its picture at |
 | Frame generation | Off | experimental |
 | Encode thread, Encode ahead | On | the next frame is translated while the GPU draws the last |
