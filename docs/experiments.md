@@ -48,6 +48,20 @@ The raw run logs are not in this repository, and most of them were deleted on 20
 
 Every experiment gets a row here before its logs are deleted. A row needs: the date, what was changed, the switch, the runs, the numbers of both sides, and a verdict.
 
+Before a log or a per-frame table is deleted, add it to the digest in `docs/data`:
+
+```
+python3 -I tools/run_digest.py docs/data <folder with the logs and the per-frame tables>
+```
+
+The two sides of an in-run A/B come from the digest, also after the log is gone:
+
+```
+python3 -I tools/ab_median.py docs/data/ab_phases.tsv <log name> <first block> <last block>
+```
+
+`tools/runsum.py` gives the one-line summary of a per-frame table, and `tools/bysize.py` the GPU encoder time of a log by render-target size.
+
 ## 10 and 11 Nov: from 28.0 ms to about 18 ms
 
 | Tried | Switch or source | Result | Verdict | Basis |
